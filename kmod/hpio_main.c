@@ -58,10 +58,10 @@ struct hpio_ring {
 	uint32_t	tail;	/* read point */
 	uint32_t	mask;	/* bit mask of ring buffer */
 
-	struct hpio_slot *slot;	/* slot array on kamlloced region "p" */
+	struct hpio_slot *slot[HPIO_SLOT_NUM];
 };
-#define hpio_ring_write_slot(r) &(r)->slot[(r)->head]
-#define hpio_ring_read_slot(r) &(r)->slot[(r)->tail]
+#define hpio_ring_write_slot(r) (r)->slot[(r)->head]
+#define hpio_ring_read_slot(r) (r)->slot[(r)->tail]
 
 
 /* hpio device structure */
@@ -115,6 +115,8 @@ static inline void hpio_del_dev(struct hpio_dev *hpdev)
 
 static int hpio_allocate_ring(struct hpio_ring *ring, int cpu)
 {
+	uint32_t i;
+
 	ring->p = kmalloc_node(HPIO_RING_SIZE, GFP_KERNEL, cpu_to_node(cpu));
 	if (!ring->p) {
 		pr_err("failed to allocate ring buffer for cpu %u\n", cpu);
@@ -125,7 +127,12 @@ static int hpio_allocate_ring(struct hpio_ring *ring, int cpu)
 	ring->head = 0;
 	ring->tail = 0;
 	ring->mask = HPIO_SLOT_NUM - 1;
-	ring->slot = (struct hpio_slot *)ring->p;
+
+	/* assign ring->slot to actual memory address */
+	for (i = 0; i < HPIO_SLOT_NUM; i++) {
+		ring->slot[i] = (struct hpio_slot *)(ring->p +
+						     HPIO_SLOT_SIZE * i);
+	}
 
 	pr_info("%s: ring for cpu %u, mem:%p\n", __func__, cpu, ring->p);
 
