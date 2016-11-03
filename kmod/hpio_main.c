@@ -31,10 +31,12 @@ struct hpio_slot {
 
 
 /* packet buffer size of a slot */
-#define HPIO_PACKET_SIZE (HPIO_SLOT_SIZE - sizeof(struct hpio_slot))
+#define HPIO_PACKET_SIZE \
+	(HPIO_SLOT_SIZE - sizeof(struct hpio_slot) + sizeof(char *))
 
 /* slot length with actual packet */
-#define HPIO_SLOT_LEN(s) ((s)->pkt_len + sizeof(struct hpio_slot))
+#define HPIO_SLOT_LEN(s) \
+	((s)->pkt_len + sizeof(struct hpio_slot) - sizeof(char *))
 
 /* XXX: packet length should be spearated to .h for user apps? */
 
