@@ -150,17 +150,24 @@ static inline bool ring_full(const struct hpio_ring *r)
 	return (((r->head + 1) & r->mask) == r->tail);
 }
 
-static inline void ring_write_next(struct hpio_ring *r, uint32_t count)
+static inline void ring_write_next(struct hpio_ring *r)
 {
-	r->head = (r->head + count) & r->mask;
+	r->head = (r->head + 1) & r->mask;
 }
 
-static inline void ring_read_next(struct hpio_ring *r, uint32_t count)
+static inline void ring_read_next(struct hpio_ring *r)
 {
-	r->tail = (r->tail + count) & r->mask;
+	r->tail = (r->tail + 1) & r->mask;
 }
 
-
+static inline u32 ring_read_avail(const struct hpio_ring *r)
+{
+	if (r->head > r->tail) {
+		return r->head - r->tail;
+	} else {
+		return r->mask - r->tail + r->head;
+	}
+}
 
 
 /* rx register handler */
@@ -188,7 +195,7 @@ rx_handler_result_t hpio_handle_frame(struct sk_buff **pskb)
 	slot->tstamp = skb_hwtstamps(skb)->hwtstamp.tv64;
 	memcpy(slot->pkt, skb_mac_header(skb), copylen);
 
-	ring_write_next(ring, 1);
+	ring_write_next(ring);
 
 done:
 	kfree_skb(skb);
@@ -221,7 +228,7 @@ hpio_open(struct inode *inode, struct file *filp)
 		return -ENODEV;
 	}
 
-	if (filp->private_data) {
+	if (filp->private_data == hpdev) {
 		pr_err("char dev %s is already opend\n", devname);
 		return -EBUSY;
 	}
@@ -234,18 +241,15 @@ hpio_open(struct inode *inode, struct file *filp)
 static ssize_t
 hpio_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 {
-	unsigned int copylen;
+	u32 copylen;
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), rx);
 	struct hpio_slot *slot = hpio_ring_read_slot(ring);
 
 	/* copy 1 packet */
 
-	if (ring_empty(ring)) {
-		pr_info("%s: empty, head %u tail %u\n",
-			__func__, ring->head, ring->tail);
+	if (ring_empty(ring))
 		return 0;
-	}
 
 	copylen = count > HPIO_SLOT_LEN(slot) ? HPIO_SLOT_LEN(slot) : count;
 
@@ -254,9 +258,64 @@ hpio_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 		return -EFAULT;
 	}
 
-	ring_read_next(ring, 1);
+	ring_read_next(ring);
 
 	return copylen;
+}
+
+static ssize_t
+hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	ssize_t rc, retval = 0;
+	size_t count = iter->nr_segs;
+	u32 copylen, copynum, avail, i;
+
+	struct file *filp = iocb->ki_filp;
+	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
+	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), rx);
+	struct hpio_slot *slot;
+
+	/* copy bulk packets to user via readv systemcall.
+	 * this copy 1 packet to 1 iovce. not similar to conventional readv.
+	 */
+
+	if (unlikely(iter->type != ITER_IOVEC)) {
+		pr_err("unsupported iter type %d\n", iter->type);
+		return -EOPNOTSUPP;
+	}
+
+
+	if (ring_empty(ring))
+		goto out;
+
+	avail = ring_read_avail(ring);
+	copynum = (avail > count) ? count : avail;
+
+	pr_debug("%s: count %lu, avail %u, copynum %u\n",
+		 __func__, count, avail, copynum);
+
+	for (i = 0; i < copynum; i++) {
+
+		slot = hpio_ring_read_slot(ring);
+		copylen = iter->iov[i].iov_len > HPIO_SLOT_LEN(slot) ?
+			HPIO_SLOT_LEN(slot) : iter->iov[i].iov_len;
+		rc = copy_to_user(iter->iov[i].iov_base,
+				  (char *)slot, copylen);
+
+		if (rc) {
+			pr_err("copy_to_user failed [%u]\n", i);
+			goto out;
+		}
+
+		retval++;
+		ring_read_next(ring);
+	}
+
+	if (retval > 0)
+		pr_info("%s: ret %lu packets\n", __func__, retval);
+
+out:
+	return retval;
 }
 
 static int
@@ -271,6 +330,7 @@ static struct file_operations hpio_fops = {
 	.owner		= THIS_MODULE,
 	.open		= hpio_open,
 	.read		= hpio_read,
+	.read_iter	= hpio_read_iter,
 	.release	= hpio_release,
 };
 

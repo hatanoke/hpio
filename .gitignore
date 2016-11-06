@@ -42,5 +42,4 @@ Module.symvers
 *.out
 
 
-mgdump
 *.pcap
