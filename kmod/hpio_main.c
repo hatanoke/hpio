@@ -4,9 +4,8 @@
 #include <linux/err.h>
 #include <linux/rtnetlink.h>
 #include <linux/wait.h>
-#include <net/genetlink.h>
 #include <linux/miscdevice.h>
-
+#include <net/genetlink.h>
 
 #undef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -32,11 +31,11 @@ struct hpio_slot {
 
 /* packet buffer size of a slot */
 #define HPIO_PACKET_SIZE \
-	(HPIO_SLOT_SIZE - sizeof(struct hpio_slot) + sizeof(char *))
+	(HPIO_SLOT_SIZE - sizeof(struct hpio_slot) + sizeof(char))
 
 /* slot length with actual packet */
 #define HPIO_SLOT_LEN(s) \
-	((s)->pkt_len + sizeof(struct hpio_slot) - sizeof(char *))
+	((s)->pkt_len + sizeof(struct hpio_slot) - sizeof(char))
 
 /* XXX: packet length should be spearated to .h for user apps? */
 
@@ -207,7 +206,7 @@ hpio_open(struct inode *inode, struct file *filp)
 	struct net_device *dev;
 	char devname[IFNAMSIZ];
 
-	strncpy (devname, filp->f_path.dentry->d_name.name, IFNAMSIZ);
+	strncpy(devname, filp->f_path.dentry->d_name.name, IFNAMSIZ);
 
 	dev = dev_get_by_name(&init_net, devname);
 	if (!dev) {
@@ -222,15 +221,12 @@ hpio_open(struct inode *inode, struct file *filp)
 		return -ENODEV;
 	}
 
+	if (filp->private_data) {
+		pr_err("char dev %s is already opend\n", devname);
+		return -EBUSY;
+	}
+
 	filp->private_data = hpdev;
-
-	return 0;
-}
-
-static int
-hpio_release(struct inode *inode, struct file *filp)
-{
-	filp->private_data = NULL;
 
 	return 0;
 }
@@ -263,6 +259,13 @@ hpio_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 	return copylen;
 }
 
+static int
+hpio_release(struct inode *inode, struct file *filp)
+{
+	filp->private_data = NULL;
+
+	return 0;
+}
 
 static struct file_operations hpio_fops = {
 	.owner		= THIS_MODULE,
@@ -360,17 +363,23 @@ failed:
 
 
 int
-unregister_hpio_dev(struct hpio_dev *hpdev)
+unregister_hpio_dev(struct hpio_dev *hpdev, bool lock_rtnl)
 {
 	int i;
 
-	pr_info("unregister device %s from hpio\n", hpdev->dev->name);
+	pr_info("unregister device %s from hpio\n", hpdev->path);
 
 	hpio_del_dev(hpdev);
 
-	rtnl_lock();
+	if (lock_rtnl)
+		rtnl_lock();
+
 	netdev_rx_handler_unregister(hpdev->dev);
-	rtnl_unlock();
+
+	if (lock_rtnl)
+		rtnl_unlock();
+
+	hpdev->dev = NULL;
 
 	misc_deregister(&hpdev->mdev);
 
@@ -384,11 +393,33 @@ unregister_hpio_dev(struct hpio_dev *hpdev)
 
 	/* XXX: free tx rings here */
 
-
 	kfree(hpdev);
 
 	return 0;
 }
+
+static int hpio_netdev_event(struct notifier_block *unused,
+			     unsigned long event, void *ptr)
+{
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct hpio_dev *hpdev = hpio_find_dev(&hpio, dev);
+
+	if (event == NETDEV_UNREGISTER && hpdev) {
+		pr_info("net device %s is removed\n", dev->name);
+		unregister_hpio_dev(hpdev, false);
+
+		/* XXX: absolutely something wrong! however,
+		 * dec refcnt is needed to avoid the race condition...
+		 */
+		this_cpu_dec(*dev->pcpu_refcnt);
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block hpio_notifier_block __read_mostly = {
+	.notifier_call = hpio_netdev_event,
+};
 
 
 static void hpio_init(void)
@@ -402,23 +433,34 @@ static void hpio_init(void)
 
 static int __init hpio_init_module(void)
 {
+	int rc;
 	struct net_device *dev;
 
 	pr_info("hpio (v%s) is loaded\n", HPIO_VERSION);
 
 	hpio_init();
 
+
+	/* temporary until implement iproute2 */
 	if (!ifname) {
 		pr_err("insmod %s.ko ifname=eth0\n", DRV_NAME);
 		return -EINVAL;
 	}
-
 	dev = dev_get_by_name(&init_net, ifname);
 	if (!dev)
 		return -ENODEV;
 
 
+	rc = register_netdevice_notifier(&hpio_notifier_block);
+	if (rc)
+		goto notifier_failed;
+
+
 	return register_hpio_dev(dev);
+
+
+notifier_failed:
+	return rc;
 }
 module_init(hpio_init_module);
 
@@ -432,7 +474,10 @@ static void __exit hpio_exit_module(void)
 	dev = dev_get_by_name(&init_net, ifname);
 	hpdev = hpio_find_dev(&hpio, dev);
 
-	unregister_hpio_dev(hpdev);
+	if (hpdev)
+		unregister_hpio_dev(hpdev, true);
+
+	unregister_netdevice_notifier(&hpio_notifier_block);
 
 	return;
 }
