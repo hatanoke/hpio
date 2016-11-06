@@ -312,7 +312,7 @@ hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 	}
 
 	if (retval > 0)
-		pr_info("%s: ret %lu packets\n", __func__, retval);
+		pr_debug("%s: ret %lu packets\n", __func__, retval);
 
 out:
 	return retval;
