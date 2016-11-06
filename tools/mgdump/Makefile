@@ -1,6 +1,6 @@
 TARGET = mgdump
 
-CFLAGS = -Wall -O2 $(readv_$(READV))
+CFLAGS = -Wall -O2 $(readv_$(READV)) $(pcap_$(PCAP))
 LDFLAGS= -pthread
 CC=gcc
 
@@ -8,6 +8,9 @@ READV?=no
 readv_yes= -DREADV
 readv_no=
 
+PCAP?=yes
+pcap_yes= -DPCAP
+pcap_no=
 
 SRCS := mgdump.c
 OBJS = $(subst .c,.o,$(SRCS))

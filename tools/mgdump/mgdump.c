@@ -134,25 +134,29 @@ void *rx_thread(void *arg)
 
 	struct hpio_slot {
 		uint16_t        pkt_len;
+		uint16_t	copied_len;
 		uint64_t        tstamp; 
 		char pkt[2048];
 	} __attribute__ ((__packed__));
 
 #ifdef READV
 	/* use readv */
-#define BULKNUM 16
+#define BULKNUM 512
 	struct hpio_slot slot[BULKNUM];
 	struct iovec iov[BULKNUM];
 #else
 	struct hpio_slot slot;
 #endif
 
+	int fdo, count;
+
+#ifdef PCAP
+	struct hpio_slot *sp;
 	char obuf[2048];
-
-	int fdo, count, copy_len, rc;
-
+	int copy_len, rc;
 	unsigned short pktlen;
 	unsigned long tstamp;
+#endif
 
 #ifdef READV
 	/* initialize iovec */
@@ -204,32 +208,35 @@ void *rx_thread(void *arg)
 #else
 		count = read(priv->fdi, (char *)&slot, sizeof(slot));
 #endif
-
 		if (count < 1) {
-			//usleep(INTERVAL_100USEC);
-			sleep (1);
+			usleep(INTERVAL_100USEC);
 			continue;
 		}
 		
 #ifdef READV
 		for (n = 0; count; count--, n++) {
-			pktlen = slot[n].pkt_len;
-			tstamp = slot[n].tstamp;
-			copy_len = pcapng_epb_memcpy(obuf, (char *)&slot[n],
-						     pktlen, tstamp);
-#else
-			pktlen = slot.pkt_len;
-			tstamp = slot.tstamp;
-			copy_len = pcapng_epb_memcpy(obuf, (char *)&slot,
-						     pktlen, tstamp);
 #endif
 
-			++priv->stat_pktcount;
 
+#ifdef PCAP
+
+#ifdef READV
+			sp = &slot[n];
+#else
+			sp = &slot;
+#endif /* READV */
+			pktlen = sp->pkt_len;
+			tstamp = sp->tstamp;
+			copy_len = pcapng_epb_memcpy(obuf, (char *)sp,
+						     pktlen, tstamp);
 			// dump to file
 			rc = write(fdo, obuf, copy_len);
 			if (rc < 0)
 				printf("write failed\n");
+#endif /* PCAP */
+
+			++priv->stat_pktcount;
+
 #ifdef READV
 		}
 #endif
@@ -265,6 +272,13 @@ int main(int argc, char **argv)
 	unsigned int sum, pre_sum;
 
 	char ifname[11 + IFNAMSIZ];
+
+#ifdef READV
+	printf("using readv syscall\n");
+#endif
+#ifndef PCAP
+	printf("pcap dump is disabled\n");
+#endif
 
 	// count number of online cpus
 	CPU_ZERO(&cpu_set);
