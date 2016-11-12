@@ -22,26 +22,15 @@ MODULE_LICENSE("GPL");
 #define HPIO_SLOT_SIZE	2048
 #define HPIO_SLOT_NUM	1024
 
-struct hpio_slot {
-	uint16_t	pkt_len;	/* length of packet */
-	uint64_t	tstamp;		/* XXX: for mgdump compatibility */
-	char pkt[1];			/* packet pointer */
+struct hpio_hdr {
+	uint16_t	pktlen;
+	uint64_t	tstamp;
 } __attribute__ ((__packed__));
 
+#define packet_copy_len(pktlen, buflen) \
+	buflen > pktlen + sizeof(struct hpio_hdr) ? \
+	pktlen : buflen - sizeof(struct hpio_hdr)
 
-/* packet buffer size of a slot */
-#define HPIO_PACKET_SIZE \
-	(HPIO_SLOT_SIZE - sizeof(struct hpio_slot) + sizeof(char))
-
-/* slot length with actual packet */
-#define HPIO_SLOT_LEN(s) \
-	((s)->pkt_len + sizeof(struct hpio_slot) - sizeof(char))
-
-/* XXX: packet length should be spearated to .h for user apps? */
-
-
-
-#define HPIO_RING_SIZE	(HPIO_SLOT_SIZE * HPIO_SLOT_NUM)
 
 
 /* XXX: will be handled by genetlink iproute2 */
@@ -54,15 +43,12 @@ MODULE_PARM_DESC(ifname, "target network device name");
 
 /* packet buffer ring structure */
 struct hpio_ring {
-	uint8_t		*p;	/* malloc pointer */
 	uint32_t	head;	/* write point */
 	uint32_t	tail;	/* read point */
 	uint32_t	mask;	/* bit mask of ring buffer */
 
-	struct hpio_slot *slot[HPIO_SLOT_NUM];
+	struct sk_buff *skb_array[HPIO_SLOT_NUM];
 };
-#define hpio_ring_write_slot(r) (r)->slot[(r)->head]
-#define hpio_ring_read_slot(r) (r)->slot[(r)->tail]
 
 
 /* hpio device structure */
@@ -114,32 +100,6 @@ static inline void hpio_del_dev(struct hpio_dev *hpdev)
 
 /* ring operations */
 
-static int hpio_allocate_ring(struct hpio_ring *ring, int cpu)
-{
-	uint32_t i;
-
-	ring->p = kmalloc_node(HPIO_RING_SIZE, GFP_KERNEL, cpu_to_node(cpu));
-	if (!ring->p) {
-		pr_err("failed to allocate ring buffer for cpu %u\n", cpu);
-		return -ENOMEM;
-	}
-
-	memset(ring->p, 0, HPIO_RING_SIZE);
-	ring->head = 0;
-	ring->tail = 0;
-	ring->mask = HPIO_SLOT_NUM - 1;
-
-	/* assign ring->slot to actual memory address */
-	for (i = 0; i < HPIO_SLOT_NUM; i++) {
-		ring->slot[i] = (struct hpio_slot *)(ring->p +
-						     HPIO_SLOT_SIZE * i);
-	}
-
-	pr_info("%s: ring for cpu %u, mem:%p\n", __func__, cpu, ring->p);
-
-	return 0;
-}
-
 static inline bool ring_empty(const struct hpio_ring *r)
 {
 	return (r->head == r->tail);
@@ -170,6 +130,30 @@ static inline u32 ring_read_avail(const struct hpio_ring *r)
 }
 
 
+static void hpio_init_rx_ring(struct hpio_ring *ring)
+{
+	ring->head = 0;
+	ring->tail = 0;
+	ring->mask = HPIO_SLOT_NUM - 1;
+}
+
+static void hpio_destroy_rx_ring(struct hpio_ring *ring)
+{
+	uint32_t i, n;
+	struct sk_buff *skb;
+
+	/* free pushed skbs */
+
+	n = ring_read_avail(ring);
+	for (i = 0; i < n; i++) {
+		skb = ring->skb_array[ring->tail];
+		kfree_skb(skb);
+		ring_read_next(ring);
+	}
+}
+
+
+
 /* rx register handler */
 
 static struct hpio_dev *hpio_dev_get_rcu(const struct net_device *d)
@@ -179,23 +163,19 @@ static struct hpio_dev *hpio_dev_get_rcu(const struct net_device *d)
 
 rx_handler_result_t hpio_handle_frame(struct sk_buff **pskb)
 {
-	uint32_t pktlen, copylen;
 	struct sk_buff *skb = *pskb;
 	struct hpio_dev *hpdev = hpio_dev_get_rcu(skb->dev);
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), rx);
-	struct hpio_slot *slot = hpio_ring_write_slot(ring);
 
 	if (ring_full(ring))
 		goto done;
 
-	pktlen = skb->mac_len + skb->len;
-	copylen = (pktlen > HPIO_PACKET_SIZE) ? HPIO_PACKET_SIZE : pktlen;
-	
-	slot->pkt_len = copylen;
-	slot->tstamp = skb_hwtstamps(skb)->hwtstamp.tv64;
-	memcpy(slot->pkt, skb_mac_header(skb), copylen);
-
+	ring->skb_array[ring->head] = skb;
 	ring_write_next(ring);
+
+	*pskb = NULL;
+
+	return RX_HANDLER_CONSUMED;
 
 done:
 	kfree_skb(skb);
@@ -241,22 +221,29 @@ hpio_open(struct inode *inode, struct file *filp)
 static ssize_t
 hpio_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 {
-	u32 copylen;
+	u32 copylen, pktlen;
+	struct sk_buff *skb;
+	struct hpio_hdr hdr;
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), rx);
-	struct hpio_slot *slot = hpio_ring_read_slot(ring);
 
 	/* copy 1 packet */
 
 	if (ring_empty(ring))
 		return 0;
 
-	copylen = count > HPIO_SLOT_LEN(slot) ? HPIO_SLOT_LEN(slot) : count;
+	skb = ring->skb_array[ring->tail];
+	pktlen = skb->mac_len + skb->len;
+	copylen = packet_copy_len(pktlen, count);
 
-	if (copy_to_user(buf, (char *)slot, copylen)) {
-		pr_err("%s: copy_to_user failed\n", __func__);
-		return -EFAULT;
-	}
+	hdr.pktlen = pktlen;
+	hdr.tstamp = skb_hwtstamps(skb)->hwtstamp.tv64;
+
+	copy_to_user(buf, (char *)&hdr, sizeof(hdr));
+	copy_to_user(buf + sizeof(hdr), skb_mac_header(skb), copylen);
+
+
+	kfree_skb(skb);	/* should be delayed execution? */
 
 	ring_read_next(ring);
 
@@ -266,14 +253,15 @@ hpio_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 static ssize_t
 hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
-	ssize_t rc, retval = 0;
+	ssize_t retval = 0;
 	size_t count = iter->nr_segs;
-	u32 copylen, copynum, avail, i;
+	u32 copylen, pktlen,copynum, avail, i;
 
 	struct file *filp = iocb->ki_filp;
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), rx);
-	struct hpio_slot *slot;
+	struct hpio_hdr hdr;
+	struct sk_buff *skb;
 
 	/* copy bulk packets to user via readv systemcall.
 	 * this copy 1 packet to 1 iovce. not similar to conventional readv.
@@ -283,7 +271,6 @@ hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 		pr_err("unsupported iter type %d\n", iter->type);
 		return -EOPNOTSUPP;
 	}
-
 
 	if (ring_empty(ring))
 		goto out;
@@ -296,16 +283,19 @@ hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 	for (i = 0; i < copynum; i++) {
 
-		slot = hpio_ring_read_slot(ring);
-		copylen = iter->iov[i].iov_len > HPIO_SLOT_LEN(slot) ?
-			HPIO_SLOT_LEN(slot) : iter->iov[i].iov_len;
-		rc = copy_to_user(iter->iov[i].iov_base,
-				  (char *)slot, copylen);
+		skb = ring->skb_array[ring->tail];
+		pktlen = skb->mac_len + skb->len;
+		copylen = packet_copy_len(pktlen, iter->iov[i].iov_len);
 
-		if (rc) {
-			pr_err("copy_to_user failed [%u]\n", i);
-			goto out;
-		}
+		hdr.pktlen = pktlen;
+		hdr.tstamp = skb_hwtstamps(skb)->hwtstamp.tv64;
+
+		copy_to_user(iter->iov[i].iov_base,
+			     (char *)&hdr, sizeof(hdr));
+		copy_to_user(iter->iov[i].iov_base + sizeof(hdr),
+			     skb_mac_header(skb), copylen);
+
+		kfree_skb(skb);
 
 		retval++;
 		ring_read_next(ring);
@@ -339,7 +329,7 @@ static struct file_operations hpio_fops = {
 
 int register_hpio_dev(struct net_device *dev)
 {
-	int i, n, rc = 0;
+	int i, rc = 0;
 	struct hpio_dev *hpdev;
 
 	pr_info("register %s for hpio\n", dev->name);
@@ -361,6 +351,7 @@ int register_hpio_dev(struct net_device *dev)
 	memset(hpdev, 0, sizeof(struct hpio_dev));
 	snprintf(hpdev->path, 10 + IFNAMSIZ, "%s/%s", DRV_NAME, dev->name);
 	hpdev->dev = dev;
+	hpdev->num_rings = num_online_cpus();
 	hpdev->mdev.minor = MISC_DYNAMIC_MINOR;
 	hpdev->mdev.fops = &hpio_fops;
 	hpdev->mdev.name = hpdev->path;
@@ -374,12 +365,8 @@ int register_hpio_dev(struct net_device *dev)
 		goto rx_rings_failed;
 	}
 
-	hpdev->num_rings = num_online_cpus();
-
 	for (i = 0; i < hpdev->num_rings; i++) {
-		rc = hpio_allocate_ring(&hpdev->rx_rings[i], i);
-		if (rc < 0)
-			goto rx_ring_failed;
+		hpio_init_rx_ring(&hpdev->rx_rings[i]);
 	}
 
 
@@ -411,12 +398,9 @@ rx_handler_failed:
 misc_dev_failed:
 	i = hpdev->num_rings;
 
-rx_ring_failed:
-	for (n = 0; n < i; n++)	/* i is failed num of cpu */
-		kfree(hpdev->rx_rings[n].p);
-
 rx_rings_failed:
 	kfree(hpdev);
+
 failed:
 	return rc;
 }
@@ -444,10 +428,8 @@ unregister_hpio_dev(struct hpio_dev *hpdev, bool lock_rtnl)
 	misc_deregister(&hpdev->mdev);
 
 	/* free rx rings */
-	for (i = 0; i < hpdev->num_rings; i++) {
-		kfree(hpdev->rx_rings[i].p);
-		hpdev->rx_rings[i].p = NULL;
-	}
+	for (i = 0; i < hpdev->num_rings; i++)
+		hpio_destroy_rx_ring(&hpdev->rx_rings[i]);
 
 	kfree(hpdev->rx_rings);
 
