@@ -129,6 +129,15 @@ static inline u32 ring_read_avail(const struct hpio_ring *r)
 	}
 }
 
+static inline u32 ring_write_avail(const struct hpio_ring *r)
+{
+	if (r->tail > r->head) {
+		return r->tail - r->head;
+	} else {
+		return r->mask - r->head + r->tail;
+	}
+}
+
 
 static void hpio_init_rx_ring(struct hpio_ring *ring)
 {
@@ -152,7 +161,33 @@ static void hpio_destroy_rx_ring(struct hpio_ring *ring)
 	}
 }
 
+static int hpio_init_tx_ring(struct hpio_ring *ring, int cpu)
+{
+	uint32_t i;
 
+	ring->head = 0;
+	ring->tail = 0;
+	ring->mask = HPIO_SLOT_NUM - 1;
+
+	for (i = 0; i < HPIO_SLOT_NUM; i++) {
+		ring->skb_array[i] = __alloc_skb(HPIO_SLOT_SIZE, GFP_KERNEL,
+						 SKB_ALLOC_FCLONE,
+						 cpu_to_node(cpu));
+		if (!ring->skb_array[i])
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
+
+static void hpio_destroy_tx_ring(struct hpio_ring *ring)
+{
+	uint32_t i;
+
+	for (i = 0; i < HPIO_SLOT_NUM; i++)
+		kfree_skb(ring->skb_array[i]);
+}
 
 /* rx register handler */
 
@@ -255,7 +290,7 @@ hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
 	ssize_t retval = 0;
 	size_t count = iter->nr_segs;
-	u32 copylen, pktlen,copynum, avail, i;
+	u32 copylen, pktlen, copynum, avail, i;
 
 	struct file *filp = iocb->ki_filp;
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
@@ -308,6 +343,80 @@ out:
 	return retval;
 }
 
+static ssize_t hpio_write(struct file *filp, const char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	u32 copylen;
+	struct sk_buff *skb, *pskb;
+	struct hpio_hdr *hdr;
+	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
+	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), tx);
+
+	/* send 1 packet, never full */
+
+	skb = ring->skb_array[ring->head];	/* use head as buffer */
+	pskb = skb_clone(skb, GFP_ATOMIC);
+	if (!pskb)
+		return -ENOMEM;
+
+	hdr = (struct hpio_hdr *)buf;
+
+	copylen = count - sizeof(struct hpio_hdr);
+	skb_put(pskb, copylen);
+	skb_set_mac_header(pskb, 0);
+
+	copy_from_user(skb_mac_header(pskb), (char *)(hdr + 1), copylen);
+	dev_queue_xmit(pskb);
+
+	return count;
+}
+
+static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	ssize_t retval = 0;
+	size_t count = iter->nr_segs;
+	u32 copylen, avail, i, copynum;
+	struct file *filp = iocb->ki_filp;
+	struct sk_buff *skb, *pskb;
+	struct hpio_hdr *hdr;
+	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
+	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), tx);
+
+	/* send bulked packets */
+
+	avail = ring_write_avail(ring);
+	copynum = avail > count ? count : avail;
+
+	/* first, write packets to skb ring buffers */
+	for (i = 0; i < copynum; i++) {
+		skb = ring->skb_array[ring->head];
+
+		hdr = iter->iov[i].iov_base;
+
+		copylen = iter->iov[i].iov_len - sizeof(*hdr);
+		skb_put(skb, copylen);
+		skb_set_mac_header(skb, 0);
+
+		copy_from_user(skb_mac_header(skb), (char *)(hdr + 1),
+			       copylen);
+
+		ring_write_next(ring);
+	}
+
+	/* second, send queued packet XXX should be kthread workder ? */
+	avail = ring_read_avail(ring);
+	for (i = 0; i < avail; i++) {
+		skb = ring->skb_array[ring->tail];
+		pskb = skb_clone(skb, GFP_ATOMIC);
+		dev_queue_xmit(pskb);
+
+		retval++;
+		ring_read_next(ring);
+	}
+
+	return retval;	/* retrun num of xmitted packets */
+}
+
 static int
 hpio_release(struct inode *inode, struct file *filp)
 {
@@ -321,6 +430,8 @@ static struct file_operations hpio_fops = {
 	.open		= hpio_open,
 	.read		= hpio_read,
 	.read_iter	= hpio_read_iter,
+	.write		= hpio_write,
+	.write_iter	= hpio_write_iter,
 	.release	= hpio_release,
 };
 
@@ -329,7 +440,7 @@ static struct file_operations hpio_fops = {
 
 int register_hpio_dev(struct net_device *dev)
 {
-	int i, rc = 0;
+	int i, n, rc = 0;
 	struct hpio_dev *hpdev;
 
 	pr_info("register %s for hpio\n", dev->name);
@@ -356,8 +467,8 @@ int register_hpio_dev(struct net_device *dev)
 	hpdev->mdev.fops = &hpio_fops;
 	hpdev->mdev.name = hpdev->path;
 
-	/* allocate rx_rings. XXX: tx_ring is not yet */
-	hpdev->rx_rings = kmalloc(sizeof(struct hpio_ring) * num_online_cpus(),
+	/* allocate rx_rings */
+	hpdev->rx_rings = kmalloc(sizeof(struct hpio_ring) * hpdev->num_rings,
 				  GFP_KERNEL);
 	if (!hpdev->rx_rings) {
 		pr_err("failed to kmalloc rx_rings\n");
@@ -367,6 +478,23 @@ int register_hpio_dev(struct net_device *dev)
 
 	for (i = 0; i < hpdev->num_rings; i++) {
 		hpio_init_rx_ring(&hpdev->rx_rings[i]);
+	}
+
+	/* allocate tx_rings */
+	hpdev->tx_rings = kmalloc(sizeof(struct hpio_ring) * hpdev->num_rings,
+				  GFP_KERNEL);
+	if (!hpdev->tx_rings) {
+		pr_err("failed to kmalloc tx_rings\n");
+		rc = -ENOMEM;
+		goto tx_rings_failed;
+	}
+
+	for (i = 0; i < hpdev->num_rings; i++) {
+		rc = hpio_init_tx_ring(&hpdev->tx_rings[i], i);
+		if (rc < 0) {
+			pr_err("failed to kmalloc tx_ring[%u]\n", i);
+			goto tx_ring_failed;
+		}
 	}
 
 
@@ -397,6 +525,15 @@ rx_handler_failed:
 
 misc_dev_failed:
 	i = hpdev->num_rings;
+
+tx_ring_failed:
+	for (n = 0; n < i; n++) {	/* i is num of failed tx ring */
+		hpio_destroy_tx_ring(&hpdev->tx_rings[n]);
+	}
+	kfree(hpdev->tx_rings);
+
+tx_rings_failed:
+	kfree(hpdev->rx_rings);
 
 rx_rings_failed:
 	kfree(hpdev);
@@ -433,7 +570,11 @@ unregister_hpio_dev(struct hpio_dev *hpdev, bool lock_rtnl)
 
 	kfree(hpdev->rx_rings);
 
-	/* XXX: free tx rings here */
+	/* free tx rings */
+	for (i = 0; i < hpdev->num_rings; i++)
+		hpio_destroy_tx_ring(&hpdev->tx_rings[i]);
+
+	kfree(hpdev->tx_rings);
 
 	kfree(hpdev);
 
