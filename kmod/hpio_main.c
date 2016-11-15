@@ -235,9 +235,8 @@ hpio_open(struct inode *inode, struct file *filp)
 	char devname[IFNAMSIZ];
 
 	strncpy(devname, filp->f_path.dentry->d_name.name, IFNAMSIZ);
-	pr_info("open %s\n", devname);
 
-	dev = dev_get_by_name(&init_net, devname);	/* XXX */
+	dev = dev_get_by_name(&init_net, devname);	/* XXX: not init_net */
 	if (!dev) {
 		pr_err("net device %s not found\n", devname);
 		return -ENODEV;
@@ -372,7 +371,13 @@ static ssize_t hpio_write(struct file *filp, const char __user *buf,
 	ring_write_next(ring);			/* protect the skb */
 
 	hdr = (struct hpio_hdr *)buf;
-	copylen = count - sizeof(struct hpio_hdr);
+
+	if ((hdr->pktlen + sizeof(struct hpio_hdr)) > count) {
+		copylen = count - sizeof(struct hpio_hdr);
+	} else {
+		copylen = hdr->pktlen;
+	}
+
 	skb_put(skb, copylen);
 	skb_set_mac_header(skb, 0);
 
@@ -411,7 +416,14 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 		hdr = (struct hpio_hdr *) iter->iov[i].iov_base;
 
-		copylen = iter->iov[i].iov_len - sizeof(struct hpio_hdr);
+		if ((hdr->pktlen + sizeof(struct hpio_hdr)) >
+		    iter->iov[i].iov_len) {
+			copylen = iter->iov[i].iov_len -
+				sizeof(struct hpio_hdr);
+		} else {
+			copylen = hdr->pktlen;
+		}
+
 		skb_put(skb, copylen);
 		skb_set_mac_header(skb, 0);
 
@@ -451,8 +463,6 @@ static int
 hpio_release(struct inode *inode, struct file *filp)
 {
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
-
-	pr_info("release %s\n", hpdev->dev->name);
 
 	rtnl_lock();
 	netdev_rx_handler_unregister(hpdev->dev);
