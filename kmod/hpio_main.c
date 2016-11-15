@@ -6,6 +6,8 @@
 #include <linux/wait.h>
 #include <linux/miscdevice.h>
 #include <net/genetlink.h>
+#include <net/netns/generic.h>
+#include <net/net_namespace.h>
 
 #include "hpio.h"
 
@@ -40,7 +42,6 @@ struct hpio_ring {
 /* hpio device structure */
 struct hpio_dev {
 	struct list_head	list;	/* hpio->dev_list */
-	struct rcu_head		rcu;
 
 	struct net_device	*dev;	/* net device */
 	struct miscdevice	mdev;	/* character device */
@@ -53,34 +54,40 @@ struct hpio_dev {
 #define hpio_get_ring(h, idx, di) &((h)->di##_rings[idx])
 
 
-struct hpio {
-	struct list_head	dev_list;	/* hpio_dev lists */
+static unsigned int hpio_net_id;
+
+/* per netnamespace structure */
+struct hpio_net {
+	struct list_head	dev_list;	/* hpio_dev list */
 };
 
-struct hpio hpio; /* XXX: this structure should be per namespace structure */
+
 
 /* hpio global structure operations */
 
-static inline struct hpio_dev *hpio_find_dev(struct hpio *hpio,
+static inline struct hpio_dev *hpio_find_dev(struct net *net,
 					     struct net_device *dev)
 {
 	struct hpio_dev *hpdev;
+	struct hpio_net *hpnet;
 
-	list_for_each_entry_rcu(hpdev, &hpio->dev_list, list) {
+	hpnet = (struct hpio_net *) net_generic(net, hpio_net_id);
+
+	list_for_each_entry(hpdev, &hpnet->dev_list, list) {
 		if (hpdev->dev == dev)
 			return hpdev;
 	}
 	return NULL;
 }
 
-static inline void hpio_add_dev(struct hpio *hpio, struct hpio_dev *hpdev)
+static inline void hpio_add_dev(struct hpio_net *hpnet, struct hpio_dev *hpdev)
 {
-	list_add_rcu(&hpdev->list, &hpio->dev_list);
+	list_add(&hpdev->list, &hpnet->dev_list);
 }
 
-static inline void hpio_del_dev(struct hpio_dev *hpdev)
+static inline void hpio_del_dev(struct hpio_net *hpnet, struct hpio_dev *hpdev)
 {
-	list_del_rcu(&hpdev->list);
+	list_del(&hpdev->list);
 }
 
 
@@ -110,18 +117,22 @@ static inline u32 ring_read_avail(const struct hpio_ring *r)
 {
 	if (r->head > r->tail) {
 		return r->head - r->tail;
-	} else {
+	} if (r->tail > r->head) {
 		return r->mask - r->tail + r->head;
 	}
+
+	return 0;
 }
 
 static inline u32 ring_write_avail(const struct hpio_ring *r)
 {
 	if (r->tail > r->head) {
 		return r->tail - r->head;
-	} else {
+	} if (r->head > r->tail) {
 		return r->mask - r->head + r->tail;
 	}
+
+	return 0;
 }
 
 
@@ -219,14 +230,15 @@ hpio_open(struct inode *inode, struct file *filp)
 	char devname[IFNAMSIZ];
 
 	strncpy(devname, filp->f_path.dentry->d_name.name, IFNAMSIZ);
+	pr_info("open %s\n", devname);
 
-	dev = dev_get_by_name(&init_net, devname);
+	dev = dev_get_by_name(&init_net, devname);	/* XXX */
 	if (!dev) {
 		pr_err("net device %s not found\n", devname);
 		return -ENODEV;
 	}
 
-	hpdev = hpio_find_dev(&hpio, dev);
+	hpdev = hpio_find_dev(dev_net(dev), dev);
 	if (!hpdev) {
 		pr_err("net device %s is not registered fot hpio\n",
 		       devname);
@@ -242,6 +254,11 @@ hpio_open(struct inode *inode, struct file *filp)
 
 	/* start to hook rx packets */
 	rtnl_lock();
+	if (netdev_is_rx_handler_busy(dev)) {
+		rtnl_unlock();
+		return -EBUSY;
+	}
+
 	netdev_rx_handler_register(dev, hpio_handle_frame, hpdev);
 	rtnl_unlock();
 
@@ -417,10 +434,12 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 static int
 hpio_release(struct inode *inode, struct file *filp)
 {
-	struct hpio_dev *hpio = (struct hpio_dev *)filp->private_data;
+	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
+
+	pr_info("release %s\n", hpdev->dev->name);
 
 	rtnl_lock();
-	netdev_rx_handler_unregister(hpio->dev);
+	netdev_rx_handler_unregister(hpdev->dev);
 	rtnl_unlock();
 
 	filp->private_data = NULL;
@@ -441,27 +460,13 @@ static struct file_operations hpio_fops = {
 
 /* hpio device operations */
 
-int register_hpio_dev(struct net_device *dev)
+int init_hpio_dev(struct hpio_dev *hpdev, struct net_device *dev)
 {
 	int i, n, rc = 0;
-	struct hpio_dev *hpdev;
 
-	pr_info("register %s for hpio\n", dev->name);
+	pr_info("register device %s to hpio\n", dev->name);
 
-	if (hpio_find_dev(&hpio, dev)) {
-		pr_err("net device %s is already registered for hpio\n",
-		       dev->name);
-		return -EBUSY;
-	}
-
-	/* allocate hpio device structure */
-	hpdev = kmalloc(sizeof(struct hpio_dev), GFP_KERNEL);
-	if (!hpdev) {
-		pr_err("failed to kmalloc hpio_dev for %s\n", dev->name);
-		rc = -ENOMEM;
-		goto failed;
-	}
-
+	/* init hpio device structure */
 	memset(hpdev, 0, sizeof(struct hpio_dev));
 	snprintf(hpdev->path, 10 + IFNAMSIZ, "%s/%s", DRV_NAME, dev->name);
 	hpdev->dev = dev;
@@ -507,9 +512,6 @@ int register_hpio_dev(struct net_device *dev)
 		goto misc_dev_failed;
 	}
 
-	/* save hpio_dev to hpio->dev_list */
-	hpio_add_dev(&hpio, hpdev);
-
 	return 0;
 
 
@@ -528,19 +530,14 @@ tx_rings_failed:
 rx_rings_failed:
 	kfree(hpdev);
 
-failed:
 	return rc;
 }
 
 
-int
-unregister_hpio_dev(struct hpio_dev *hpdev)
+static void
+destroy_hpio_dev(struct hpio_dev *hpdev)
 {
 	int i;
-
-	pr_info("unregister device %s from hpio\n", hpdev->path);
-
-	hpio_del_dev(hpdev);
 
 	hpdev->dev = NULL;
 
@@ -559,82 +556,74 @@ unregister_hpio_dev(struct hpio_dev *hpdev)
 	kfree(hpdev->tx_rings);
 
 	kfree(hpdev);
-
-	return 0;
 }
 
-static int hpio_netdev_event(struct notifier_block *unused,
-			     unsigned long event, void *ptr)
+
+static __net_init int hpio_init_net(struct net *net)
 {
-	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
-	struct hpio_dev *hpdev = hpio_find_dev(&hpio, dev);
-
-	if (event == NETDEV_REGISTER && !hpdev) {
-		pr_info("new net device %s is added\n", dev->name);
-		register_hpio_dev(dev);
-	}
-
-	if (event == NETDEV_UNREGISTER && hpdev) {
-		pr_info("net device %s is removed\n", dev->name);
-		unregister_hpio_dev(hpdev);
-
-		if (dev->rx_handler == hpio_handle_frame)
-			netdev_rx_handler_unregister(dev);
-
-		/* XXX: absolutely something wrong! however,
-		 * dec refcnt is needed to avoid the race condition...
-		 */
-		this_cpu_dec(*dev->pcpu_refcnt);
-	}
-
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block hpio_notifier_block __read_mostly = {
-	.notifier_call = hpio_netdev_event,
-};
-
-
-static void hpio_init(void)
-{
-	/* init global struct hpio. shouled be integrated into 
-	 * per namespace structure.
-	 */
-
-	INIT_LIST_HEAD(&hpio.dev_list);
-}
-
-static int __init hpio_init_module(void)
-{
-	int rc;
+	int rc = 0;
 	struct net_device *dev;
+	struct hpio_dev *hpdev;
+	struct hpio_net *hpnet = net_generic(net, hpio_net_id);
 
-	pr_info("load hpio (v%s)\n", HPIO_VERSION);
+	INIT_LIST_HEAD(&hpnet->dev_list);
 
-	hpio_init();
+	for_each_netdev_rcu(net, dev) {
 
-	/*
-	 * register all net devices to hpio.
-	 * rx_handler is registered when char dev is opened.
-	 * XXX: this should be handled on per net_namepsace structure
-	 * in the __net_init function.
-	 */
-	rcu_read_lock();
-	for_each_netdev_rcu(&init_net, dev) {
-		rc = register_hpio_dev(dev);
+		hpdev = kmalloc(sizeof(struct hpio_dev), GFP_KERNEL);
+		if (!hpdev)
+			return -ENOMEM;
+
+		rc = init_hpio_dev(hpdev, dev);
 		if (rc < 0) {
 			pr_err("failed to register %s to hpio\n", dev->name);
 			goto failed;
 		}
-	}
-	rcu_read_unlock();
 
-	rc = register_netdevice_notifier(&hpio_notifier_block);
-	if (rc)
+		hpio_add_dev(hpnet, hpdev);
+	}
+
+failed:
+	return rc;
+}
+
+static __net_exit void hpio_exit_net(struct net *net)
+{
+	struct net_device *dev;
+	struct hpio_dev *hpdev;
+	struct hpio_net *hpnet;
+	struct list_head *p, *tmp;
+
+	hpnet = (struct hpio_net *) net_generic(net, hpio_net_id);
+
+	list_for_each_safe(p, tmp, &hpnet->dev_list) {
+		dev = hpdev->dev;
+		hpdev = list_entry(p, struct hpio_dev, list);
+		hpio_del_dev(hpnet, hpdev);
+		destroy_hpio_dev(hpdev);
+	}
+}
+
+static struct pernet_operations hpio_net_ops = {
+	.init	= hpio_init_net,
+	.exit	= hpio_exit_net,
+	.id	= &hpio_net_id,
+	.size	= sizeof(struct hpio_net),
+};
+
+
+static int __init hpio_init_module(void)
+{
+	int rc;
+	pr_info("load hpio (v%s)\n", HPIO_VERSION);
+
+	rc = register_pernet_subsys(&hpio_net_ops);
+	if (rc != 0) {
+		pr_err("init netns failed\n");
 		goto failed;
+	}
 
 	return 0;
-
 
 failed:
 	return rc;
@@ -643,26 +632,10 @@ module_init(hpio_init_module);
 
 static void __exit hpio_exit_module(void)
 {
-	struct hpio_dev *hpdev;
-	struct list_head *p, *tmp;
 
 	pr_info("unload hpio (v%s)\n", HPIO_VERSION);
 
-	unregister_netdevice_notifier(&hpio_notifier_block);
-
-	/*
-	 * unregister all hpio devices.
-	 * XXX: this should be handled on per net_namespace structure
-	 * in the __net_exit function.
-	 */
-	rtnl_lock();
-	list_for_each_safe(p, tmp, &hpio.dev_list) {
-		hpdev = list_entry(p, struct hpio_dev, list);
-		if (hpdev->dev->rx_handler == hpio_handle_frame)
-			netdev_rx_handler_unregister(hpdev->dev);
-		unregister_hpio_dev(hpdev);
-	}
-	rtnl_unlock();
+	unregister_pernet_subsys(&hpio_net_ops);
 
 	return;
 }
