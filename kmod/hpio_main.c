@@ -5,6 +5,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/wait.h>
 #include <linux/miscdevice.h>
+#include <linux/pid.h>
 #include <net/genetlink.h>
 #include <net/netns/generic.h>
 #include <net/net_namespace.h>
@@ -50,6 +51,8 @@ struct hpio_dev {
 	uint8_t			num_rings;	/* min (cpu, queue)*/
 	struct hpio_ring	*rx_rings;
 	struct hpio_ring	*tx_rings;
+
+	pid_t pid;	/* pid of the process open this hpio device */
 };
 #define hpio_get_ring(h, idx, di) &((h)->di##_rings[idx])
 
@@ -121,6 +124,7 @@ static inline u32 ring_read_avail(const struct hpio_ring *r)
 		return r->mask - r->tail + r->head;
 	}
 
+	/* ring empty */
 	return 0;
 }
 
@@ -132,7 +136,8 @@ static inline u32 ring_write_avail(const struct hpio_ring *r)
 		return r->mask - r->head + r->tail;
 	}
 
-	return 0;
+	/* ring empty, all slots are avaialble */
+	return r->mask;
 }
 
 
@@ -245,21 +250,18 @@ hpio_open(struct inode *inode, struct file *filp)
 		return -ENODEV;
 	}
 
-	if (filp->private_data == hpdev) {
-		pr_err("char dev %s is already opend\n", devname);
-		return -EBUSY;
-	}
 
+	/* overwrite private_data when 2nd open
+	 * XXX: should check pid of the process open.
+	 * but, file->f_owner->pid is 0...
+	 */
 	filp->private_data = hpdev;
 
 	/* start to hook rx packets */
 	rtnl_lock();
-	if (netdev_is_rx_handler_busy(dev)) {
-		rtnl_unlock();
-		return -EBUSY;
+	if (!netdev_is_rx_handler_busy(dev)) {
+		netdev_rx_handler_register(dev, hpio_handle_frame, hpdev);
 	}
-
-	netdev_rx_handler_register(dev, hpio_handle_frame, hpdev);
 	rtnl_unlock();
 
 	return 0;
@@ -419,12 +421,24 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 	/* second, send queued packet XXX should be kthread workder ? */
 	avail = ring_read_avail(ring);
+
+	pr_debug("%s: read count %lu, avail %u, head %u, tail %u\n",
+		 __func__, count, avail, ring->head, ring->tail);
+
 	for (i = 0; i < avail; i++) {
+
+		if (unlikely(!netif_running(hpdev->dev) ||
+			     !netif_carrier_ok(hpdev->dev))) {
+			goto next;
+		}
+
 		skb = ring->skb_array[ring->tail];
 		pskb = skb_clone(skb, GFP_ATOMIC);
 		dev_queue_xmit(pskb);
 
 		retval++;
+
+	next:
 		ring_read_next(ring);
 	}
 
@@ -470,6 +484,7 @@ int init_hpio_dev(struct hpio_dev *hpdev, struct net_device *dev)
 	memset(hpdev, 0, sizeof(struct hpio_dev));
 	snprintf(hpdev->path, 10 + IFNAMSIZ, "%s/%s", DRV_NAME, dev->name);
 	hpdev->dev = dev;
+	hpdev->pid = 0;
 	hpdev->num_rings = num_online_cpus();
 	hpdev->mdev.minor = MISC_DYNAMIC_MINOR;
 	hpdev->mdev.fops = &hpio_fops;
