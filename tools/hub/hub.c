@@ -207,7 +207,8 @@ int main (int argc, char **argv)
 		rev_pdts[n].devpath_l = devpath_r;
 		rev_pdts[n].cpu = n;
 
-		ret = pthread_create(&pdts[n].tid, NULL, pipe_body, &pdts[n]);
+		ret = pthread_create(&rev_pdts[n].tid, NULL, pipe_body,
+				     &rev_pdts[n]);
 		if (ret < 0) {
 			perror("pthread_create");
 			return -1;
