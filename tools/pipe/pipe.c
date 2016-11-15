@@ -68,8 +68,14 @@ void *pipe_body(void *arg)
 	int n, cnt, ret;
 	cpu_set_t target_cpu_set;
 	struct pipe_thread *pdt = (struct pipe_thread *)arg;
-	struct hpio_slot slot[BULKNUM];
 	struct iovec iov[BULKNUM];
+
+	struct hpio_slot {
+		struct hpio_hdr hdr;
+		char buf[2048];
+	} __attribute__ ((__packed__));
+
+	struct hpio_slot slot[BULKNUM];
 
 
 	/* pin cpu runnign this thread */

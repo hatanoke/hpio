@@ -371,17 +371,19 @@ static ssize_t hpio_write(struct file *filp, const char __user *buf,
 	skb = ring->skb_array[ring->head];	/* use head as buffer */
 	ring_write_next(ring);			/* protect the skb */
 
+	hdr = (struct hpio_hdr *)buf;
+	copylen = count - sizeof(struct hpio_hdr);
+	skb_put(skb, copylen);
+	skb_set_mac_header(skb, 0);
+
+	copy_from_user(skb_mac_header(skb), (char *)(hdr + 1), copylen);
+
 	pskb = skb_clone(skb, GFP_ATOMIC);
 	if (!pskb)
 		return -ENOMEM;
 
-	hdr = (struct hpio_hdr *)buf;
 
-	copylen = count - sizeof(struct hpio_hdr);
-	skb_put(pskb, copylen);
-	skb_set_mac_header(pskb, 0);
 
-	copy_from_user(skb_mac_header(pskb), (char *)(hdr + 1), copylen);
 	dev_queue_xmit(pskb);
 
 	return count;
@@ -407,9 +409,9 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	for (i = 0; i < copynum; i++) {
 		skb = ring->skb_array[ring->head];
 
-		hdr = iter->iov[i].iov_base;
+		hdr = (struct hpio_hdr *) iter->iov[i].iov_base;
 
-		copylen = iter->iov[i].iov_len - sizeof(*hdr);
+		copylen = iter->iov[i].iov_len - sizeof(struct hpio_hdr);
 		skb_put(skb, copylen);
 		skb_set_mac_header(skb, 0);
 

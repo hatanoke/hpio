@@ -11,11 +11,5 @@ struct hpio_hdr {
 } __attribute__ ((__packed__));
 
 
-struct hpio_slot {
-	struct hpio_hdr hdr;
-	char pkt[1];
-} __attribute__ ((__packed__));
-
-
 
 #endif
