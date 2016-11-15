@@ -7,6 +7,8 @@
 #include <linux/miscdevice.h>
 #include <net/genetlink.h>
 
+#include "hpio.h"
+
 #undef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -19,26 +21,10 @@ MODULE_DESCRIPTION("haeena packet i/o");
 MODULE_LICENSE("GPL");
 
 
-#define HPIO_SLOT_SIZE	2048
-#define HPIO_SLOT_NUM	1024
-
-struct hpio_hdr {
-	uint16_t	pktlen;
-	uint64_t	tstamp;
-} __attribute__ ((__packed__));
 
 #define packet_copy_len(pktlen, buflen) \
 	buflen > pktlen + sizeof(struct hpio_hdr) ? \
 	pktlen : buflen - sizeof(struct hpio_hdr)
-
-
-
-/* XXX: will be handled by genetlink iproute2 */
-static char *ifname = NULL;
-module_param(ifname, charp, S_IRUGO);
-MODULE_PARM_DESC(ifname, "target network device name");
-
-
 
 
 /* packet buffer ring structure */
@@ -161,7 +147,8 @@ static void hpio_destroy_rx_ring(struct hpio_ring *ring)
 	}
 }
 
-static int hpio_init_tx_ring(struct hpio_ring *ring, int cpu)
+static int hpio_init_tx_ring(struct hpio_ring *ring, int cpu,
+			     struct net_device *dev)
 {
 	uint32_t i;
 
@@ -170,11 +157,13 @@ static int hpio_init_tx_ring(struct hpio_ring *ring, int cpu)
 	ring->mask = HPIO_SLOT_NUM - 1;
 
 	for (i = 0; i < HPIO_SLOT_NUM; i++) {
-		ring->skb_array[i] = __alloc_skb(HPIO_SLOT_SIZE, GFP_KERNEL,
-						 SKB_ALLOC_FCLONE,
+		ring->skb_array[i] = __alloc_skb(HPIO_PACKET_SIZE,
+						 GFP_KERNEL, SKB_ALLOC_FCLONE,
 						 cpu_to_node(cpu));
 		if (!ring->skb_array[i])
 			return -ENOMEM;
+
+		ring->skb_array[i]->dev = dev;
 	}
 
 	return 0;
@@ -219,6 +208,7 @@ done:
 }
 
 
+
 /* character device operations */
 
 static int
@@ -249,6 +239,11 @@ hpio_open(struct inode *inode, struct file *filp)
 	}
 
 	filp->private_data = hpdev;
+
+	/* start to hook rx packets */
+	rtnl_lock();
+	netdev_rx_handler_register(dev, hpio_handle_frame, hpdev);
+	rtnl_unlock();
 
 	return 0;
 }
@@ -355,6 +350,8 @@ static ssize_t hpio_write(struct file *filp, const char __user *buf,
 	/* send 1 packet, never full */
 
 	skb = ring->skb_array[ring->head];	/* use head as buffer */
+	ring_write_next(ring);			/* protect the skb */
+
 	pskb = skb_clone(skb, GFP_ATOMIC);
 	if (!pskb)
 		return -ENOMEM;
@@ -420,6 +417,12 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 static int
 hpio_release(struct inode *inode, struct file *filp)
 {
+	struct hpio_dev *hpio = (struct hpio_dev *)filp->private_data;
+
+	rtnl_lock();
+	netdev_rx_handler_unregister(hpio->dev);
+	rtnl_unlock();
+
 	filp->private_data = NULL;
 
 	return 0;
@@ -490,13 +493,12 @@ int register_hpio_dev(struct net_device *dev)
 	}
 
 	for (i = 0; i < hpdev->num_rings; i++) {
-		rc = hpio_init_tx_ring(&hpdev->tx_rings[i], i);
+		rc = hpio_init_tx_ring(&hpdev->tx_rings[i], i, dev);
 		if (rc < 0) {
 			pr_err("failed to kmalloc tx_ring[%u]\n", i);
 			goto tx_ring_failed;
 		}
 	}
-
 
 	/* register character device */
 	rc = misc_register(&hpdev->mdev);
@@ -505,23 +507,11 @@ int register_hpio_dev(struct net_device *dev)
 		goto misc_dev_failed;
 	}
 
-	/* register rx handler */
-	rtnl_lock();
-	rc = netdev_rx_handler_register(hpdev->dev, hpio_handle_frame, hpdev);
-	rtnl_unlock();
-	if (rc < 0) {
-		pr_err("failed to register rx hander for %s", dev->name);
-		goto rx_handler_failed;
-	}
-
 	/* save hpio_dev to hpio->dev_list */
 	hpio_add_dev(&hpio, hpdev);
 
 	return 0;
 
-
-rx_handler_failed:
-	misc_deregister(&hpdev->mdev);
 
 misc_dev_failed:
 	i = hpdev->num_rings;
@@ -544,21 +534,13 @@ failed:
 
 
 int
-unregister_hpio_dev(struct hpio_dev *hpdev, bool lock_rtnl)
+unregister_hpio_dev(struct hpio_dev *hpdev)
 {
 	int i;
 
 	pr_info("unregister device %s from hpio\n", hpdev->path);
 
 	hpio_del_dev(hpdev);
-
-	if (lock_rtnl)
-		rtnl_lock();
-
-	netdev_rx_handler_unregister(hpdev->dev);
-
-	if (lock_rtnl)
-		rtnl_unlock();
 
 	hpdev->dev = NULL;
 
@@ -587,9 +569,17 @@ static int hpio_netdev_event(struct notifier_block *unused,
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct hpio_dev *hpdev = hpio_find_dev(&hpio, dev);
 
+	if (event == NETDEV_REGISTER && !hpdev) {
+		pr_info("new net device %s is added\n", dev->name);
+		register_hpio_dev(dev);
+	}
+
 	if (event == NETDEV_UNREGISTER && hpdev) {
 		pr_info("net device %s is removed\n", dev->name);
-		unregister_hpio_dev(hpdev, false);
+		unregister_hpio_dev(hpdev);
+
+		if (dev->rx_handler == hpio_handle_frame)
+			netdev_rx_handler_unregister(dev);
 
 		/* XXX: absolutely something wrong! however,
 		 * dec refcnt is needed to avoid the race condition...
@@ -619,48 +609,60 @@ static int __init hpio_init_module(void)
 	int rc;
 	struct net_device *dev;
 
-	pr_info("hpio (v%s) is loaded\n", HPIO_VERSION);
+	pr_info("load hpio (v%s)\n", HPIO_VERSION);
 
 	hpio_init();
 
-
-	/* temporary until implement iproute2 */
-	if (!ifname) {
-		pr_err("insmod %s.ko ifname=eth0\n", DRV_NAME);
-		return -EINVAL;
+	/*
+	 * register all net devices to hpio.
+	 * rx_handler is registered when char dev is opened.
+	 * XXX: this should be handled on per net_namepsace structure
+	 * in the __net_init function.
+	 */
+	rcu_read_lock();
+	for_each_netdev_rcu(&init_net, dev) {
+		rc = register_hpio_dev(dev);
+		if (rc < 0) {
+			pr_err("failed to register %s to hpio\n", dev->name);
+			goto failed;
+		}
 	}
-	dev = dev_get_by_name(&init_net, ifname);
-	if (!dev)
-		return -ENODEV;
-
+	rcu_read_unlock();
 
 	rc = register_netdevice_notifier(&hpio_notifier_block);
 	if (rc)
-		goto notifier_failed;
+		goto failed;
+
+	return 0;
 
 
-	return register_hpio_dev(dev);
-
-
-notifier_failed:
+failed:
 	return rc;
 }
 module_init(hpio_init_module);
 
 static void __exit hpio_exit_module(void)
 {
-	struct net_device *dev;
 	struct hpio_dev *hpdev;
+	struct list_head *p, *tmp;
 
-	pr_info("hpio (v%s) is unloaded\n", HPIO_VERSION);
-
-	dev = dev_get_by_name(&init_net, ifname);
-	hpdev = hpio_find_dev(&hpio, dev);
-
-	if (hpdev)
-		unregister_hpio_dev(hpdev, true);
+	pr_info("unload hpio (v%s)\n", HPIO_VERSION);
 
 	unregister_netdevice_notifier(&hpio_notifier_block);
+
+	/*
+	 * unregister all hpio devices.
+	 * XXX: this should be handled on per net_namespace structure
+	 * in the __net_exit function.
+	 */
+	rtnl_lock();
+	list_for_each_safe(p, tmp, &hpio.dev_list) {
+		hpdev = list_entry(p, struct hpio_dev, list);
+		if (hpdev->dev->rx_handler == hpio_handle_frame)
+			netdev_rx_handler_unregister(hpdev->dev);
+		unregister_hpio_dev(hpdev);
+	}
+	rtnl_unlock();
 
 	return;
 }
