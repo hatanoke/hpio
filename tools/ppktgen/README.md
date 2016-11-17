@@ -1,5 +1,5 @@
 
-** ppktgen: posix syscall packet generator using hpio
+**ppktgen: posix syscall packet generator using hpio**
 
 ```bash
 $ make
@@ -44,7 +44,6 @@ listening on enp0s3, link-type EN10MB (Ethernet), capture size 262144 bytes
 06:06:04.500255 08:00:27:14:46:98 > 52:54:00:12:35:02, ethertype IPv4 (0x0800), length 64: 10.0.2.15.60001 > 192.168.2.2.60000: UDP, length 22
 06:06:04.500341 08:00:27:14:46:98 > 52:54:00:12:35:02, ethertype IPv4 (0x0800), length 64: 10.0.2.15.60001 > 192.168.2.2.60000: UDP, length 22
 06:06:04.500372 08:00:27:14:46:98 > 52:54:00:12:35:02, ethertype IPv4 (0x0800), length 64: 10.0.2.15.60001 > 192.168.2.2.60000: UDP, length 22
-
 ...
 
 ```
