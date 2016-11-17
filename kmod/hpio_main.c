@@ -251,17 +251,21 @@ hpio_open(struct inode *inode, struct file *filp)
 
 
 	/* overwrite private_data when 2nd open
-	 * XXX: should check pid of the process open.
-	 * but, file->f_owner->pid is 0...
+	 * XXX: should check pid of the process calling open().
+	 * but, file->f_owner->pid is 0... how to check pid from kernel?
 	 */
 	filp->private_data = hpdev;
 
 	/* start to hook rx packets */
-	rtnl_lock();
-	if (!netdev_is_rx_handler_busy(dev)) {
-		netdev_rx_handler_register(dev, hpio_handle_frame, hpdev);
+	if ((filp->f_flags & O_ACCMODE) != O_WRONLY) {
+		/* rx_handler is registered when mode is not WRONLY (read). */
+		rtnl_lock();
+		if (!netdev_is_rx_handler_busy(dev)) {
+			netdev_rx_handler_register(dev, hpio_handle_frame,
+						   hpdev);
+		}
+		rtnl_unlock();
 	}
-	rtnl_unlock();
 
 	return 0;
 }
@@ -312,7 +316,7 @@ hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 	struct sk_buff *skb;
 
 	/* copy bulk packets to user via readv systemcall.
-	 * this copy 1 packet to 1 iovce. not similar to conventional readv.
+	 * It copies 1 packet to 1 iovec. not similar to conventional readv().
 	 */
 
 	if (unlikely(iter->type != ITER_IOVEC)) {
@@ -386,7 +390,6 @@ static ssize_t hpio_write(struct file *filp, const char __user *buf,
 	pskb = skb_clone(skb, GFP_ATOMIC);
 	if (!pskb)
 		return -ENOMEM;
-
 
 
 	dev_queue_xmit(pskb);
@@ -596,6 +599,15 @@ static __net_init int hpio_init_net(struct net *net)
 	INIT_LIST_HEAD(&hpnet->dev_list);
 
 	for_each_netdev_rcu(net, dev) {
+
+		rtnl_lock();
+		if (netdev_is_rx_handler_busy(dev)) {
+			pr_info("dev %s rx_handler is already used. "
+				"so, not registered to hpio\n", dev->name);
+			rtnl_unlock();
+			continue;
+		}
+		rtnl_unlock();
 
 		hpdev = kmalloc(sizeof(struct hpio_dev), GFP_KERNEL);
 		if (!hpdev)
