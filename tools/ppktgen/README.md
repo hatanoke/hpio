@@ -37,7 +37,7 @@ ppktgen_thread: start to writev() packets on cpu 1
 ppktgen_thread: start to writev() packets on cpu 0
 
 
-$ # you can see transmitted packets with tcpdump simultaneously ppktgen
+$ # you can see transmitted packets with tcpdump simultaneously with ppktgen
 $ sudo tcpdump -eni enp0s3 
 tcpdump: verbose output suppressed, use -v or -vv for full protocol decode
 listening on enp0s3, link-type EN10MB (Ethernet), capture size 262144 bytes
