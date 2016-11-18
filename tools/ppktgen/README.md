@@ -21,7 +21,7 @@ $
 
 
 $ # execute ppktgen
-$ sudo ./ppktgen -i /dev/hpio/enp0s3 -d 192.168.2.2 -s 10.0.2.15 -D 52:54:00:12:35:02 -S 08:00:27:14:46:98 -t 1000000 -b 128 -n 2
+$ sudo ./ppktgen -i /dev/hpio/enp0s3 -d 192.168.2.2 -s 10.0.2.15 -D 52:54:00:12:35:02 -S 08:00:27:14:46:98 -b 128 -n 2
 main: ============ Parameters ============
 main: dev:               /dev/hpio/enp0s3
 main: dst IP:            192.168.2.2
@@ -31,7 +31,7 @@ main: src MAC:           08:27:27:14:46:98
 main: packet size:       64
 main: number of bulk:    128
 main: number of threads: 2
-main: transmit interval: 1000000
+main: transmit interval: 0
 main: ====================================
 ppktgen_thread: start to writev() packets on cpu 1
 ppktgen_thread: start to writev() packets on cpu 0

@@ -107,9 +107,8 @@ void * ppktgen_thread(void *arg)
 			break;
 
 		cnt = writev(pt->fd, iov, pbody->bulk);
-		if (cnt < 1) {
+		if (cnt < 0) {
 			pr_err("writev() failed on cpu %d\n", pt->cpu);
-			perror("writev");
 			exit (EXIT_FAILURE);
 		}
 
@@ -376,7 +375,7 @@ int main(int argc, char **argv)
 	build_tx_packet(&ppktgen);
 	
 	/* open hpio fd */
-	fd = open(ppktgen.devpath, O_WRONLY);
+	fd = open(ppktgen.devpath, O_RDWR);
 	if (fd < 0) {
 		pr_err("cannot open device %s\n", ppktgen.devpath);
 		perror("open");

@@ -121,7 +121,7 @@ static inline u32 ring_read_avail(const struct hpio_ring *r)
 	if (r->head > r->tail) {
 		return r->head - r->tail;
 	} if (r->tail > r->head) {
-		return r->mask - r->tail + r->head;
+		return r->mask - r->tail + r->head + 1;
 	}
 
 	/* ring empty */
@@ -133,7 +133,7 @@ static inline u32 ring_write_avail(const struct hpio_ring *r)
 	if (r->tail > r->head) {
 		return r->tail - r->head;
 	} if (r->head > r->tail) {
-		return r->mask - r->head + r->tail;
+		return r->mask - r->head + r->tail + 1;
 	}
 
 	/* ring empty, all slots are avaialble */
@@ -412,6 +412,8 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 	avail = ring_write_avail(ring);
 	copynum = avail > count ? count : avail;
+
+
 
 	/* first, write packets to skb ring buffers */
 	for (i = 0; i < copynum; i++) {
