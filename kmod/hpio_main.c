@@ -37,6 +37,7 @@ struct hpio_ring {
 	uint32_t	mask;	/* bit mask of ring buffer */
 
 	struct sk_buff *skb_array[HPIO_SLOT_NUM];
+	struct sk_buff *skb_tx_array[HPIO_SLOT_NUM]; /* ptr for cloned skb */
 };
 
 
@@ -403,7 +404,7 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	size_t count = iter->nr_segs;
 	u32 copylen, avail, i, copynum;
 	struct file *filp = iocb->ki_filp;
-	struct sk_buff *skb, *pskb;
+	struct sk_buff *skb, **pskb;
 	struct hpio_hdr *hdr;
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), tx);
@@ -414,10 +415,10 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	copynum = avail > count ? count : avail;
 
 
-
 	/* first, write packets to skb ring buffers */
 	for (i = 0; i < copynum; i++) {
 		skb = ring->skb_array[ring->head];
+		pskb = &ring->skb_tx_array[ring->head];
 
 		hdr = (struct hpio_hdr *) iter->iov[i].iov_base;
 
@@ -429,10 +430,14 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 			copylen = hdr->pktlen;
 		}
 
-		skb_put(skb, copylen);
-		skb_set_mac_header(skb, 0);
+		*pskb = skb_clone(skb, GFP_ATOMIC);
+		if (!*pskb)
+			return -ENOMEM;
 
-		copy_from_user(skb_mac_header(skb), (char *)(hdr + 1),
+		skb_put(*pskb, copylen);
+		skb_set_mac_header(*pskb, 0);
+
+		copy_from_user(skb_mac_header(*pskb), (char *)(hdr + 1),
 			       copylen);
 
 		ring_write_next(ring);
@@ -451,10 +456,8 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 			goto next;
 		}
 
-		skb = ring->skb_array[ring->tail];
-		pskb = skb_clone(skb, GFP_ATOMIC);
-		dev_queue_xmit(pskb);
-
+		skb = ring->skb_tx_array[ring->tail];
+		dev_queue_xmit(skb);
 		retval++;
 
 	next:
