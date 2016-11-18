@@ -181,6 +181,8 @@ static int hpio_init_tx_ring(struct hpio_ring *ring, int cpu,
 			return -ENOMEM;
 
 		ring->skb_array[i]->dev = dev;
+		ring->skb_array[i]->queue_mapping = smp_processor_id();
+		ring->skb_array[i]->xmit_more = 1;	/* XXX */
 	}
 
 	return 0;
@@ -400,16 +402,21 @@ static ssize_t hpio_write(struct file *filp, const char __user *buf,
 
 static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
+	int ret;
 	ssize_t retval = 0;
 	size_t count = iter->nr_segs;
 	u32 copylen, avail, i, copynum;
 	struct file *filp = iocb->ki_filp;
 	struct sk_buff *skb, **pskb;
+	struct net_device *dev;
+	struct netdev_queue *txq;
 	struct hpio_hdr *hdr;
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), tx);
 
 	/* send bulked packets */
+
+	dev = hpdev->dev;
 
 	avail = ring_write_avail(ring);
 	copynum = avail > count ? count : avail;
@@ -449,6 +456,15 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	pr_debug("%s: read count %lu, avail %u, head %u, tail %u\n",
 		 __func__, count, avail, ring->head, ring->tail);
 
+
+
+	/* send bulked packets under once lock
+	 * as same as xmit_more of pktgen_xmit() in net/core/pktgen.c
+	 */
+
+	HARD_TX_LOCK(dev, txq, smp_processor_id());
+	local_bh_disable();
+
 	for (i = 0; i < avail; i++) {
 
 		if (unlikely(!netif_running(hpdev->dev) ||
@@ -457,12 +473,35 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 		}
 
 		skb = ring->skb_tx_array[ring->tail];
-		dev_queue_xmit(skb);
-		retval++;
+		txq = skb_get_tx_queue(dev, skb);
+
+		ret = netdev_start_xmit(skb, dev, txq, avail);
+
+		/* TODO: implemente pkt/err counters */
+		switch (ret) {
+		case NETDEV_TX_BUSY :
+		case NETDEV_TX_LOCKED :
+			pr_debug("%s netdev failure\n", __func__);
+			break;
+		case NET_XMIT_DROP :
+		case NET_XMIT_CN :
+		case NET_XMIT_POLICED :
+			break;
+		}
+
+		if (!dev_xmit_complete(ret)) {
+			net_info_ratelimited("xmit failed, free cloned skb\n");
+			kfree_skb(skb);
+		} else {
+			retval++;
+		}
 
 	next:
 		ring_read_next(ring);
 	}
+
+	HARD_TX_UNLOCK(dev, txq);
+	local_bh_enable();
 
 	return retval;	/* retrun num of xmitted packets */
 }
