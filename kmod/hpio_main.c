@@ -32,6 +32,8 @@ MODULE_LICENSE("GPL");
 
 /* packet buffer ring structure */
 struct hpio_ring {
+	uint16_t	cpu;
+
 	uint32_t	head;	/* write point */
 	uint32_t	tail;	/* read point */
 	uint32_t	mask;	/* bit mask of ring buffer */
@@ -142,8 +144,9 @@ static inline u32 ring_write_avail(const struct hpio_ring *r)
 }
 
 
-static void hpio_init_rx_ring(struct hpio_ring *ring)
+static void hpio_init_rx_ring(struct hpio_ring *ring, int cpu)
 {
+	ring->cpu = cpu;
 	ring->head = 0;
 	ring->tail = 0;
 	ring->mask = HPIO_SLOT_NUM - 1;
@@ -169,6 +172,7 @@ static int hpio_init_tx_ring(struct hpio_ring *ring, int cpu,
 {
 	uint32_t i;
 
+	ring->cpu = cpu;
 	ring->head = 0;
 	ring->tail = 0;
 	ring->mask = HPIO_SLOT_NUM - 1;
@@ -462,7 +466,9 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	 * as same as xmit_more of pktgen_xmit() in net/core/pktgen.c
 	 */
 
-	HARD_TX_LOCK(dev, txq, smp_processor_id());
+	txq = netdev_get_tx_queue(dev, ring->cpu);
+
+	HARD_TX_LOCK(dev, txq, ring->cpu);
 	local_bh_disable();
 
 	for (i = 0; i < avail; i++) {
@@ -473,19 +479,16 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 		}
 
 		skb = ring->skb_tx_array[ring->tail];
-		txq = skb_get_tx_queue(dev, skb);
 
 		ret = netdev_start_xmit(skb, dev, txq, avail);
 
 		/* TODO: implemente pkt/err counters */
 		switch (ret) {
 		case NETDEV_TX_BUSY :
-		case NETDEV_TX_LOCKED :
 			pr_debug("%s netdev failure\n", __func__);
 			break;
 		case NET_XMIT_DROP :
 		case NET_XMIT_CN :
-		case NET_XMIT_POLICED :
 			break;
 		}
 
@@ -559,7 +562,7 @@ int init_hpio_dev(struct hpio_dev *hpdev, struct net_device *dev)
 	}
 
 	for (i = 0; i < hpdev->num_rings; i++) {
-		hpio_init_rx_ring(&hpdev->rx_rings[i]);
+		hpio_init_rx_ring(&hpdev->rx_rings[i], i);
 	}
 
 	/* allocate tx_rings */
