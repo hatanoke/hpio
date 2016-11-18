@@ -60,6 +60,8 @@ struct ppktgen_body {
 	int len;	/* length of the packet */
 	int bulk;	/* number of bulked packets at one writev() */
 	int interval;	/* usec interval */
+
+	unsigned long count;	/* count of excuting writev() */
 };
 
 
@@ -68,6 +70,8 @@ struct ppktgen_thread {
 	pthread_t	tid;
 	int fd;		/* write fd for hpio character device */
 	int cpu;	/* cpu this thread running on */
+
+	unsigned long count;
 
 	struct ppktgen_body *pbody;
 };
@@ -110,6 +114,12 @@ void * ppktgen_thread(void *arg)
 		if (cnt < 0) {
 			pr_err("writev() failed on cpu %d\n", pt->cpu);
 			exit (EXIT_FAILURE);
+		}
+
+		if (pt->count) {
+			pt->count--;
+			if (pt->count < 1)
+				break;
 		}
 
 		if (pbody->interval)
@@ -222,6 +232,7 @@ void usage(void)
 	       "\t -l: length of a packet\n"
 	       "\t -n: number of threads\n"
 	       "\t -b: number of bulked packets\n"
+	       "\t -c: number of executing writev() on each cpu\n"
 	       "\t -t: packet transmit interval (usec)\n"
 		);
 }
@@ -246,7 +257,7 @@ int main(int argc, char **argv)
 	ppktgen.udp_dst = htons(UDP_DST_PORT);
 	ppktgen.udp_src = htons(UDP_SRC_PORT);
 
-	while ((ch = getopt(argc, argv, "i:d:s:D:S:l:n:b:t:")) != -1) {
+	while ((ch = getopt(argc, argv, "i:d:s:D:S:l:n:b:c:t:")) != -1) {
 		switch (ch) {
 		case 'i' :
 			/* hpio device path */
@@ -329,6 +340,15 @@ int main(int argc, char **argv)
 			}
 			break;
 
+		case 'c' :
+			/* writev() count */
+			rc = sscanf(optarg, "%lu", &ppktgen.count);
+			if (rc == EOF) {
+				pr_err("invalid count %s\n", optarg);
+				return -1;
+			}
+			break;
+
 		case 't' :
 			/* packet transmit interval */
 			ppktgen.interval = atoi(optarg);
@@ -366,6 +386,7 @@ int main(int argc, char **argv)
 	pr_info("packet size:       %d\n", ppktgen.len);
 	pr_info("number of bulk:    %d\n", ppktgen.bulk);
 	pr_info("number of threads: %d\n", ppktgen.nthreads);
+	pr_info("count of writev(): %lu\n", ppktgen.count);
 	pr_info("transmit interval: %d\n", ppktgen.interval);
 	pr_info("====================================\n");
 
@@ -387,6 +408,7 @@ int main(int argc, char **argv)
 		pt[n].fd = fd;
 		pt[n].cpu = n;
 		pt[n].pbody = &ppktgen;
+		pt[n].count = ppktgen.count;
 
 		rc = pthread_create(&pt[n].tid, NULL, ppktgen_thread, &pt[n]);
 		if (rc < 0) {
