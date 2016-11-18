@@ -181,7 +181,7 @@ static int hpio_init_tx_ring(struct hpio_ring *ring, int cpu,
 			return -ENOMEM;
 
 		ring->skb_array[i]->dev = dev;
-		ring->skb_array[i]->queue_mapping = smp_processor_id();
+		ring->skb_array[i]->queue_mapping = cpu;
 		ring->skb_array[i]->xmit_more = 1;	/* XXX */
 	}
 
