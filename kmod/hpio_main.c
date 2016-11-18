@@ -461,7 +461,6 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 		 __func__, count, avail, ring->head, ring->tail);
 
 
-
 	/* send bulked packets under once lock
 	 * as same as xmit_more of pktgen_xmit() in net/core/pktgen.c
 	 */
@@ -473,14 +472,17 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 	for (i = 0; i < avail; i++) {
 
+		skb = ring->skb_tx_array[ring->tail];
+
 		if (unlikely(!netif_running(hpdev->dev) ||
-			     !netif_carrier_ok(hpdev->dev))) {
+			     !netif_carrier_ok(hpdev->dev) ||
+			     netif_xmit_frozen_or_drv_stopped(txq))) {
+			/* cannot xmit, free cloned skb and goto next */
+			kfree_skb(skb);
 			goto next;
 		}
 
-		skb = ring->skb_tx_array[ring->tail];
-
-		ret = netdev_start_xmit(skb, dev, txq, avail);
+		ret = netdev_start_xmit(skb, dev, txq, avail - i - 1);
 
 		/* TODO: implemente pkt/err counters */
 		switch (ret) {
