@@ -322,7 +322,7 @@ int main(int argc, char **argv)
 		case 'n' :
 			/* number of threads */
 			ppktgen.nthreads = atoi(optarg);
-			if (ppktgen.nthreads < 1 &&
+			if (ppktgen.nthreads < 1 ||
 			    ppktgen.nthreads > ppktgen.ncpus) {
 				pr_err("num of threads must be > 0, "
 				       "< %d\n", ppktgen.ncpus);
@@ -333,7 +333,7 @@ int main(int argc, char **argv)
 		case 'b' :
 			/* number of bulked packets */
 			ppktgen.bulk = atoi(optarg);
-			if (ppktgen.bulk < 1 && ppktgen.bulk > MAX_BULKNUM) {
+			if (ppktgen.bulk < 1 || ppktgen.bulk > MAX_BULKNUM) {
 				pr_err("num of bulked packets must be > 0, "
 				       "< %d\n", MAX_BULKNUM);
 				return -1;
