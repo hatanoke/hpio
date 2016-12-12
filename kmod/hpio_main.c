@@ -1,5 +1,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/smp.h>
 #include <linux/err.h>
 #include <linux/rtnetlink.h>
@@ -23,6 +24,15 @@ MODULE_AUTHOR("haeena.net");
 MODULE_DESCRIPTION("haeena packet i/o");
 MODULE_LICENSE("GPL");
 
+
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 8, 0)
+bool netdev_is_rx_handler_busy(struct net_device *dev)
+{
+	ASSERT_RTNL();
+	return dev && rtnl_dereference(dev->rx_handler);
+}
+#endif
 
 
 #define packet_copy_len(pktlen, buflen) \
