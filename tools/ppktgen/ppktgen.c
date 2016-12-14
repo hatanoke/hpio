@@ -36,6 +36,22 @@
 #define UDP_SRC_PORT	60001
 
 
+
+/* ppktgen thread structure */
+struct ppktgen_thread {
+	pthread_t	tid;
+	int fd;		/* write fd for hpio character device */
+	int cpu;	/* cpu this thread running on */
+
+	unsigned long count;
+
+	unsigned long pkt_count;	/* recevied packet count on
+					 * this thread for rx mode */
+
+	struct ppktgen_body *pbody;
+};
+
+
 /* ppktgen program body structure */
 struct ppktgen_body {
 	char *devpath;	/* hpio character device path */
@@ -62,18 +78,10 @@ struct ppktgen_body {
 	int interval;	/* usec interval */
 
 	unsigned long count;	/* count of excuting writev() */
-};
 
+	int print_all_cpu_pps;
 
-/* ppktgen thread structure */
-struct ppktgen_thread {
-	pthread_t	tid;
-	int fd;		/* write fd for hpio character device */
-	int cpu;	/* cpu this thread running on */
-
-	unsigned long count;
-
-	struct ppktgen_body *pbody;
+	struct ppktgen_thread pt[MAX_CPU];
 };
 
 
@@ -83,8 +91,8 @@ static int caught_signal = 0;
 
 
 
-/* ppktgen thread body on a cpu */
-void * ppktgen_thread(void *arg)
+/* ppktgen tx thread body on a cpu */
+void * ppktgen_tx_thread(void *arg)
 {
 	int n, cnt;
 	cpu_set_t target_cpu_set;
@@ -116,6 +124,8 @@ void * ppktgen_thread(void *arg)
 			exit (EXIT_FAILURE);
 		}
 
+		pt->pkt_count += cnt;
+
 		if (pt->count) {
 			pt->count--;
 			if (pt->count < 1)
@@ -129,9 +139,84 @@ void * ppktgen_thread(void *arg)
 	return NULL;
 }
 
+/* ppktgen rx thread body on a cpu */
+void * ppktgen_rx_thread(void *arg)
+{
+	int n, cnt;
+	char buf[MAX_BULKNUM][MAX_PKTLEN];
+	cpu_set_t target_cpu_set;
+	struct ppktgen_thread *pt = (struct ppktgen_thread *)arg;
+	struct ppktgen_body *pbody = pt->pbody;
+	struct iovec iov[MAX_BULKNUM];
 
 
+	/* pin this thread to a cpu */
+        CPU_ZERO(&target_cpu_set);
+	CPU_SET(pt->cpu, &target_cpu_set);
+	pthread_setaffinity_np(pt->tid, sizeof(cpu_set_t), &target_cpu_set);
 
+	/* initialize packet iovec buffer */
+	for (n = 0; n < pbody->bulk; n++) {
+		iov[n].iov_base = buf[n];	/* fill the ptr to the slot */
+		iov[n].iov_len = MAX_PKTLEN;
+	}
+
+	pr_info("start to readv() packets on cpu %d\n", pt->cpu);
+
+	/* write packets */
+	while (1) {
+		if (caught_signal)
+			break;
+
+		cnt = readv(pt->fd, iov, pbody->bulk);
+		if (cnt < 0) {
+			pr_err("readv() failed on cpu %d\n", pt->cpu);
+			exit (EXIT_FAILURE);
+		}
+
+		pt->pkt_count += cnt;
+	}
+
+	return NULL;
+}
+
+/* thread counting packets */
+void * ppktgen_count_thread(void *arg)
+{
+	int n;
+	unsigned long pps, before[MAX_CPU], after[MAX_CPU];
+	struct ppktgen_body *pbody = arg;
+
+	memset(before, 0, sizeof(unsigned long) + MAX_CPU);
+	memset(after, 0, sizeof(unsigned long) + MAX_CPU);
+
+	while (1) {
+		if (caught_signal)
+			break;
+
+		for (n = 0; n < pbody->nthreads; n++)
+			before[n] = pbody->pt[n].pkt_count;
+
+		sleep (1);
+
+		for (n = 0; n < pbody->nthreads; n++)
+			after[n] = pbody->pt[n].pkt_count;
+
+		pps = 0;
+		for (n = 0; n < pbody->nthreads; n++)
+			pps += after[n] - before[n];
+
+		printf("SUM: %lu pps", pps);
+		if (pbody->print_all_cpu_pps) {
+			for (n = 0; n < pbody->nthreads; n++)
+				printf(" CPU%d: %lu pps", n, after[n] - before[n]);
+		}
+		printf("\n");
+
+	}
+
+	return NULL;
+}
 
 void sig_handler(int sig)
 {
@@ -225,6 +310,8 @@ void usage(void)
 {
 	printf("ppktgen usage:\n"
 	       "\t -i: path to hpio device\n"
+	       "\t -r: rx mode (rx at all CPU)(default is tx)\n"
+	       "\t -a: print pps stat on each CPU\n"
 	       "\t -d: destination IPv4 address\n"
 	       "\t -s: source IPv4 address\n"
 	       "\t -D: destination MAC address\n"
@@ -240,11 +327,11 @@ void usage(void)
 int main(int argc, char **argv)
 {
 
-	int fd, ch, n, rc;
+	int fd, ch, n, rc, rx_mode = 0;
 	int dmacbuf[ETH_ALEN], smacbuf[ETH_ALEN];
 	char buf[16];		/* for printing parameters to stdout */
+	pthread_t pkt_count_tid;	/* pthread id for pkt count thread */
 	struct ppktgen_body ppktgen;
-	struct ppktgen_thread pt[MAX_CPU];
 
 	memset(dmacbuf, 0, sizeof(dmacbuf));
 	memset(smacbuf, 0, sizeof(smacbuf));
@@ -253,15 +340,23 @@ int main(int argc, char **argv)
 	ppktgen.ncpus = count_online_cpus();
 	ppktgen.nthreads = 1;
 	ppktgen.bulk = 1;
-	ppktgen.len = 64;
+	ppktgen.len = 60;
 	ppktgen.udp_dst = htons(UDP_DST_PORT);
 	ppktgen.udp_src = htons(UDP_SRC_PORT);
 
-	while ((ch = getopt(argc, argv, "i:d:s:D:S:l:n:b:c:t:")) != -1) {
+	while ((ch = getopt(argc, argv, "i:rad:s:D:S:l:n:b:c:t:")) != -1) {
 		switch (ch) {
 		case 'i' :
 			/* hpio device path */
 			ppktgen.devpath = optarg;
+			break;
+
+		case 'r' :
+			rx_mode = 1;
+			break;
+
+		case 'a' :
+			ppktgen.print_all_cpu_pps = 1;
 			break;
 
 		case 'd' :
@@ -311,7 +406,7 @@ int main(int argc, char **argv)
 		case 'l' :
 			/* length of the packet */
 			ppktgen.len = atoi(optarg);
-			if (ppktgen.len < 64 || ppktgen.len > MAX_PKTLEN) {
+			if (ppktgen.len < 60 || ppktgen.len > MAX_PKTLEN) {
 				pr_err("pkt len must be >= 64, < %d\n",
 				       MAX_PKTLEN);
 				return -1;
@@ -364,6 +459,14 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (rx_mode) {
+		/* In RX mode, ppktgen receives packets on all CPUs
+		 * because hpio (currently )does not support all
+		 * packets to specified CPU(s).
+		 */
+		ppktgen.nthreads = ppktgen.ncpus;
+	}
+
 
 	/* print parameters */
 	pr_info("============ Parameters ============\n");
@@ -405,16 +508,31 @@ int main(int argc, char **argv)
 
 	/* create threads */
 	for (n = 0; n < ppktgen.nthreads; n++) {
-		pt[n].fd = fd;
-		pt[n].cpu = n;
-		pt[n].pbody = &ppktgen;
-		pt[n].count = ppktgen.count;
+		ppktgen.pt[n].fd = fd;
+		ppktgen.pt[n].cpu = n;
+		ppktgen.pt[n].pbody = &ppktgen;
+		ppktgen.pt[n].count = ppktgen.count;
 
-		rc = pthread_create(&pt[n].tid, NULL, ppktgen_thread, &pt[n]);
+		if (!rx_mode) {
+			rc = pthread_create(&ppktgen.pt[n].tid, NULL,
+					    ppktgen_tx_thread, &ppktgen.pt[n]);
+		} else {
+			rc = pthread_create(&ppktgen.pt[n].tid, NULL,
+					    ppktgen_rx_thread, &ppktgen.pt[n]);
+		}
+
 		if (rc < 0) {
 			perror("pthread_create");
 			exit(EXIT_FAILURE);
 		}
+	}
+
+	/* start packet count thread */
+	rc = pthread_create(&pkt_count_tid, NULL, ppktgen_count_thread,
+			    &ppktgen);
+	if (rc < 0) {
+		perror("pthread_create");
+		exit(EXIT_FAILURE);
 	}
 
 	/* set signal */
@@ -425,8 +543,10 @@ int main(int argc, char **argv)
 
 	/* thread join */
 	for (n = 0; n < ppktgen.nthreads; n++)
-		pthread_join(pt[n].tid, NULL);
+		pthread_join(ppktgen.pt[n].tid, NULL);
 
+
+	pthread_join(pkt_count_tid, NULL);
 
 	close (fd);
 
