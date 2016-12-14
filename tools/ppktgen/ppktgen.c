@@ -169,6 +169,10 @@ void * ppktgen_rx_thread(void *arg)
 			break;
 
 		cnt = readv(pt->fd, iov, pbody->bulk);
+		if (cnt == 0) {
+			usleep(100);
+			continue;
+		}
 		if (cnt < 0) {
 			pr_err("readv() failed on cpu %d\n", pt->cpu);
 			exit (EXIT_FAILURE);
