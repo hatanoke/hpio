@@ -42,6 +42,7 @@ struct ppktgen_thread {
 	pthread_t	tid;
 	int fd;		/* write fd for hpio character device */
 	int cpu;	/* cpu this thread running on */
+	int thn;        /* thread number */
 
 	unsigned long count;
 
@@ -111,8 +112,6 @@ void * ppktgen_tx_thread(void *arg)
 		iov[n].iov_len = pbody->len + sizeof(struct hpio_hdr);
 	}
 
-	pr_info("start to writev() packets on cpu %d\n", pt->cpu);
-
 	/* write packets */
 	while (1) {
 		if (caught_signal)
@@ -160,8 +159,6 @@ void * ppktgen_rx_thread(void *arg)
 		iov[n].iov_base = buf[n];	/* fill the ptr to the slot */
 		iov[n].iov_len = MAX_PKTLEN;
 	}
-
-	pr_info("start to readv() packets on cpu %d\n", pt->cpu);
 
 	/* write packets */
 	while (1) {
@@ -213,7 +210,8 @@ void * ppktgen_count_thread(void *arg)
 		printf("SUM: %lu pps", pps);
 		if (pbody->print_all_cpu_pps) {
 			for (n = 0; n < pbody->nthreads; n++)
-				printf(" CPU%d: %lu pps", n, after[n] - before[n]);
+				printf(" CPU%d: %lu pps", n,
+				       after[n] - before[n]);
 		}
 		printf("\n");
 
@@ -321,6 +319,7 @@ void usage(void)
 	       "\t -D: destination MAC address\n"
 	       "\t -S: source MAC address\n"
 	       "\t -l: length of a packet\n"
+	       "\t -m: CPU mask (hex)\n"
 	       "\t -n: number of threads\n"
 	       "\t -b: number of bulked packets\n"
 	       "\t -c: number of executing writev() on each cpu\n"
@@ -331,10 +330,11 @@ void usage(void)
 int main(int argc, char **argv)
 {
 
-	int fd, ch, n, rc, rx_mode = 0;
+	int fd, ch, n, cpu, rc, rx_mode = 0;
 	int dmacbuf[ETH_ALEN], smacbuf[ETH_ALEN];
 	char buf[16];		/* for printing parameters to stdout */
 	pthread_t pkt_count_tid;	/* pthread id for pkt count thread */
+	unsigned int use_cpu = 0, mask;
 	struct ppktgen_body ppktgen;
 
 	memset(dmacbuf, 0, sizeof(dmacbuf));
@@ -348,7 +348,7 @@ int main(int argc, char **argv)
 	ppktgen.udp_dst = htons(UDP_DST_PORT);
 	ppktgen.udp_src = htons(UDP_SRC_PORT);
 
-	while ((ch = getopt(argc, argv, "i:rad:s:D:S:l:n:b:c:t:")) != -1) {
+	while ((ch = getopt(argc, argv, "i:rad:s:D:S:l:m:n:b:c:t:")) != -1) {
 		switch (ch) {
 		case 'i' :
 			/* hpio device path */
@@ -417,6 +417,14 @@ int main(int argc, char **argv)
 			}
 			break;
 
+		case 'm' :
+			/* CPU mask to specify CPUs to run threads */
+			rc = sscanf(optarg, "%x", &use_cpu);
+			if (rc < 1) {
+				pr_err("invalid cpu mask %s\n", optarg);
+				return -1;
+			}
+			break;
 
 		case 'n' :
 			/* number of threads */
@@ -493,6 +501,7 @@ int main(int argc, char **argv)
 	pr_info("packet size:       %d\n", ppktgen.len);
 	pr_info("number of bulk:    %d\n", ppktgen.bulk);
 	pr_info("number of threads: %d\n", ppktgen.nthreads);
+	pr_info("CPU mask:          0x%x\n", use_cpu);
 	pr_info("count of writev(): %lu\n", ppktgen.count);
 	pr_info("transmit interval: %d\n", ppktgen.interval);
 	pr_info("====================================\n");
@@ -511,11 +520,36 @@ int main(int argc, char **argv)
 	}
 
 	/* create threads */
+	mask = 1;
 	for (n = 0; n < ppktgen.nthreads; n++) {
+
+		if (use_cpu) {
+			/* find next cpu to use */
+			while(!(mask & use_cpu)) {
+				if (mask == 0) {
+					mask = 1;
+					continue;
+				}
+				mask <<= 1;
+			}
+
+			/* convert bitmask to cpu number */
+			for (cpu = 0; !(mask == (1 << cpu)); cpu++);
+
+			/* in next loop, start at next bit */
+			mask <<= 1;
+		} else {
+			cpu = n;
+		}
+
 		ppktgen.pt[n].fd = fd;
-		ppktgen.pt[n].cpu = n;
+		ppktgen.pt[n].thn = n;
+		ppktgen.pt[n].cpu = cpu;
 		ppktgen.pt[n].pbody = &ppktgen;
 		ppktgen.pt[n].count = ppktgen.count;
+
+		pr_info("Create thread %d on cpu %d\n",
+			ppktgen.pt[n].thn, ppktgen.pt[n].cpu);
 
 		if (!rx_mode) {
 			rc = pthread_create(&ppktgen.pt[n].tid, NULL,
@@ -529,6 +563,7 @@ int main(int argc, char **argv)
 			perror("pthread_create");
 			exit(EXIT_FAILURE);
 		}
+
 	}
 
 	/* start packet count thread */
