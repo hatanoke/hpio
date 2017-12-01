@@ -34,6 +34,13 @@ bool netdev_is_rx_handler_busy(struct net_device *dev)
 }
 #endif
 
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 9, 0)
+#define hwtstamp	hwtstamp.tv64
+#else
+/* ktime_t was changed from union to s64 since kernel 4.10 */
+#define hwtstamp	hwtstamp
+#endif
+
 
 #define packet_copy_len(pktlen, buflen) \
 	buflen > pktlen + sizeof(struct hpio_hdr) ? \
@@ -306,7 +313,7 @@ hpio_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 	copylen = packet_copy_len(pktlen, count);
 
 	hdr.pktlen = pktlen;
-	hdr.tstamp = skb_hwtstamps(skb)->hwtstamp.tv64;
+	hdr.tstamp = skb_hwtstamps(skb)->hwtstamp;
 
 	copy_to_user(buf, (char *)&hdr, sizeof(hdr));
 	copy_to_user(buf + sizeof(hdr), skb_mac_header(skb), copylen);
@@ -357,7 +364,7 @@ hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 		copylen = packet_copy_len(pktlen, iter->iov[i].iov_len);
 
 		hdr.pktlen = pktlen;
-		hdr.tstamp = skb_hwtstamps(skb)->hwtstamp.tv64;
+		hdr.tstamp = skb_hwtstamps(skb)->hwtstamp;
 
 		copy_to_user(iter->iov[i].iov_base,
 			     (char *)&hdr, sizeof(hdr));
