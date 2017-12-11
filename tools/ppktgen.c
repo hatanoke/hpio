@@ -157,7 +157,7 @@ void build_tx_packet(struct ppktgen_body *pbody, struct ppktgen_thread *pt)
 	udp = (struct udphdr *)(ip + 1);
 	udp->uh_ulen	= htons(pbody->len - sizeof(*eth) - sizeof(*ip));
 	udp->uh_dport	= pbody->udp_dst;
-	udp->uh_sport	= (pbody->udp_src + pt->cpu) * 0x61C88647 << 16 >> 16;
+	udp->uh_sport	= ((pbody->udp_src + pt->cpu) * 0x61C88647) & 0xffff;
 	/* XXX: magical value from include/linux/hash.h for RSS */
 
 }
