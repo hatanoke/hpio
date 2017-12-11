@@ -44,6 +44,11 @@ struct ppktgen_thread {
 	int cpu;	/* cpu this thread running on */
 	int thn;        /* thread number */
 
+	struct hpio_slot {
+		struct hpio_hdr hdr;
+		char pkt[MAX_PKTLEN];
+	} __attribute__ ((__packed__)) slot;	/* hpio slot pkt buffer */
+
 	unsigned long count;
 
 	unsigned long pkt_count;	/* recevied packet count on
@@ -68,12 +73,6 @@ struct ppktgen_body {
 	int ncpus;	/* number of cpus */
 	int nthreads;	/* number of threads */
 
-	struct hpio_slot {
-		struct hpio_hdr hdr;
-		char pkt[MAX_PKTLEN];
-	} __attribute__ ((__packed__)) slot;	/* hpio slot pkt buffer */
-
-	char *pkt;	/* &slot.pkt*/
 	int len;	/* length of the packet */
 	int bulk;	/* number of bulked packets at one writev() */
 	int interval;	/* usec interval */
@@ -92,6 +91,79 @@ static int caught_signal = 0;
 
 
 
+/* from netmap pkt-gen.c */
+static uint16_t
+checksum (const void * data, uint16_t len, uint32_t sum)
+{
+	const uint8_t *addr = data;
+	uint32_t i;
+
+	/* Checksum all the pairs of bytes first... */
+	for (i = 0; i < (len & ~1U); i += 2) {
+		sum += (u_int16_t)ntohs(*((u_int16_t *)(addr + i)));
+		if (sum > 0xFFFF)
+			sum -= 0xFFFF;
+	}
+	/*
+         * If there's a single byte left over, checksum it, too.
+         * Network byte order is big-endian, so the remaining byte is
+         * the high byte.
+         */
+
+	if (i < len) {
+		sum += addr[i] << 8;
+		if (sum > 0xFFFF)
+			sum -= 0xFFFF;
+	}
+
+	return sum;
+}
+
+static u_int16_t
+wrapsum (u_int32_t sum)
+{
+	sum = ~sum & 0xFFFF;
+	return (htons(sum));
+}
+
+void build_tx_packet(struct ppktgen_body *pbody, struct ppktgen_thread *pt)
+{
+	struct ethhdr *eth;
+	struct ip *ip;
+	struct udphdr *udp;
+
+	/* build ether header */
+	eth = (struct ethhdr *)pt->slot.pkt;
+	memcpy(eth->h_dest, pbody->dst_mac, ETH_ALEN);
+	memcpy(eth->h_source, pbody->src_mac, ETH_ALEN);
+	eth->h_proto = htons(ETH_P_IP);
+
+	/* build ip header */
+	ip = (struct ip*)(eth + 1);
+	ip->ip_v	= IPVERSION;
+	ip->ip_hl	= 5;
+	ip->ip_id	= 0;
+	ip->ip_tos	= IPTOS_LOWDELAY;
+	ip->ip_len	= htons(pbody->len - sizeof(*eth));
+	ip->ip_off	= 0;
+	ip->ip_ttl	= 16;
+	ip->ip_p	= IPPROTO_UDP;
+	ip->ip_dst	= pbody->dst_ip;
+	ip->ip_src	= pbody->src_ip;
+	ip->ip_sum	= 0;
+	ip->ip_sum	= wrapsum(checksum(ip, sizeof(*ip), 0));
+
+	/* build udp header */
+	udp = (struct udphdr *)(ip + 1);
+	udp->uh_ulen	= htons(pbody->len - sizeof(*eth) - sizeof(*ip));
+	udp->uh_dport	= pbody->udp_dst;
+	udp->uh_sport	= (pbody->udp_src + pt->cpu) * 0x61C88647 << 16 >> 16;
+	/* XXX: magical value from include/linux/hash.h for RSS */
+
+}
+
+
+
 /* ppktgen tx thread body on a cpu */
 void * ppktgen_tx_thread(void *arg)
 {
@@ -106,9 +178,15 @@ void * ppktgen_tx_thread(void *arg)
 	CPU_SET(pt->cpu, &target_cpu_set);
 	pthread_setaffinity_np(pt->tid, sizeof(cpu_set_t), &target_cpu_set);
 
+	/* initialize slot and build packet */
+	pt->slot.hdr.version = HPIO_HDR_VERSION;
+	pt->slot.hdr.hdrlen = sizeof(struct hpio_hdr);
+	pt->slot.hdr.pktlen = pbody->len;
+	build_tx_packet(pbody, pt);
+
 	/* initialize packet iovec buffer */
 	for (n = 0; n < pbody->bulk; n++) {
-		iov[n].iov_base = &pbody->slot;	/* fill the ptr to the slot */
+		iov[n].iov_base = &pt->slot;	/* fill the ptr to the slot */
 		iov[n].iov_len = pbody->len + sizeof(struct hpio_hdr);
 	}
 
@@ -156,7 +234,7 @@ void * ppktgen_rx_thread(void *arg)
 
 	/* initialize packet iovec buffer */
 	for (n = 0; n < pbody->bulk; n++) {
-		iov[n].iov_base = buf[n];	/* fill the ptr to the slot */
+		iov[n].iov_base = buf[n];	/* fill the ptr to the buf */
 		iov[n].iov_len = MAX_PKTLEN;
 	}
 
@@ -236,75 +314,6 @@ int count_online_cpus(void)
 	return -1;
 }
 
-
-/* from netmap pkt-gen.c */
-static uint16_t
-checksum (const void * data, uint16_t len, uint32_t sum)
-{
-	const uint8_t *addr = data;
-	uint32_t i;
-
-	/* Checksum all the pairs of bytes first... */
-	for (i = 0; i < (len & ~1U); i += 2) {
-		sum += (u_int16_t)ntohs(*((u_int16_t *)(addr + i)));
-		if (sum > 0xFFFF)
-			sum -= 0xFFFF;
-	}
-	/*
-         * If there's a single byte left over, checksum it, too.
-         * Network byte order is big-endian, so the remaining byte is
-         * the high byte.
-         */
-
-	if (i < len) {
-		sum += addr[i] << 8;
-		if (sum > 0xFFFF)
-			sum -= 0xFFFF;
-	}
-
-	return sum;
-}
-
-static u_int16_t
-wrapsum (u_int32_t sum)
-{
-	sum = ~sum & 0xFFFF;
-	return (htons(sum));
-}
-
-void build_tx_packet(struct ppktgen_body *pbody)
-{
-	struct ethhdr *eth;
-	struct ip *ip;
-	struct udphdr *udp;
-
-	/* build ether header */
-	eth = (struct ethhdr *)pbody->slot.pkt;
-	memcpy(eth->h_dest, pbody->dst_mac, ETH_ALEN);
-	memcpy(eth->h_source, pbody->src_mac, ETH_ALEN);
-	eth->h_proto = htons(ETH_P_IP);
-
-	/* build ip header */
-	ip = (struct ip*)(eth + 1);
-	ip->ip_v	= IPVERSION;
-	ip->ip_hl	= 5;
-	ip->ip_id	= 0;
-	ip->ip_tos	= IPTOS_LOWDELAY;
-	ip->ip_len	= htons(pbody->len - sizeof(*eth));
-	ip->ip_off	= 0;
-	ip->ip_ttl	= 16;
-	ip->ip_p	= IPPROTO_UDP;
-	ip->ip_dst	= pbody->dst_ip;
-	ip->ip_src	= pbody->src_ip;
-	ip->ip_sum	= 0;
-	ip->ip_sum	= wrapsum(checksum(ip, sizeof(*ip), 0));
-
-	/* build udp header */
-	udp = (struct udphdr *)(ip + 1);
-	udp->uh_dport	= pbody->udp_dst;
-	udp->uh_sport	= pbody->udp_src;
-	udp->uh_ulen	= htons(pbody->len - sizeof(*eth) - sizeof(*ip));
-}
 
 
 
@@ -507,12 +516,6 @@ int main(int argc, char **argv)
 	pr_info("====================================\n");
 
 
-	/* initialize slot and build packet */
-	ppktgen.slot.hdr.version = HPIO_HDR_VERSION;
-	ppktgen.slot.hdr.hdrlen = sizeof(struct hpio_hdr);
-	ppktgen.slot.hdr.pktlen = ppktgen.len;
-	build_tx_packet(&ppktgen);
-	
 	/* open hpio fd */
 	fd = open(ppktgen.devpath, O_RDWR);
 	if (fd < 0) {
