@@ -43,3 +43,5 @@ Module.symvers
 
 
 *.pcap
+
+core
