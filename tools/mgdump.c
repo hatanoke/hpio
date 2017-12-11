@@ -133,9 +133,7 @@ void *rx_thread(void *arg)
 
 
 	struct hpio_slot {
-		uint16_t        pkt_len;
-		uint16_t	copied_len;
-		uint64_t        tstamp; 
+		struct hpio_hdr hdr;
 		char pkt[2048];
 	} __attribute__ ((__packed__));
 
@@ -225,8 +223,8 @@ void *rx_thread(void *arg)
 #else
 			sp = &slot;
 #endif /* READV */
-			pktlen = sp->pkt_len;
-			tstamp = sp->tstamp;
+			pktlen = sp->hdr.pktlen;
+			tstamp = sp->hdr.tstamp;
 			copy_len = pcapng_epb_memcpy(obuf, (char *)sp,
 						     pktlen, tstamp);
 			// dump to file

@@ -508,6 +508,8 @@ int main(int argc, char **argv)
 
 
 	/* initialize slot and build packet */
+	ppktgen.slot.hdr.version = HPIO_HDR_VERSION;
+	ppktgen.slot.hdr.hdrlen = sizeof(struct hpio_hdr);
 	ppktgen.slot.hdr.pktlen = ppktgen.len;
 	build_tx_packet(&ppktgen);
 	

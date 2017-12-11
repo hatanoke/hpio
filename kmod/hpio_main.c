@@ -312,6 +312,8 @@ hpio_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 	pktlen = skb->mac_len + skb->len;
 	copylen = packet_copy_len(pktlen, count);
 
+	hdr.version = HPIO_HDR_VERSION;
+	hdr.hdrlen = sizeof(struct hpio_hdr)  >> 2;
 	hdr.pktlen = pktlen;
 	hdr.tstamp = skb_hwtstamps(skb)->hwtstamp;
 
@@ -363,6 +365,8 @@ hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 		pktlen = skb->mac_len + skb->len;
 		copylen = packet_copy_len(pktlen, iter->iov[i].iov_len);
 
+		hdr.version = HPIO_HDR_VERSION;
+		hdr.hdrlen = sizeof(struct hpio_hdr) >> 2;
 		hdr.pktlen = pktlen;
 		hdr.tstamp = skb_hwtstamps(skb)->hwtstamp;
 
@@ -395,10 +399,17 @@ static ssize_t hpio_write(struct file *filp, const char __user *buf,
 
 	/* send 1 packet, never full */
 
-	skb = ring->skb_array[ring->head];	/* use head as buffer */
-	ring_write_next(ring);			/* protect the skb */
 
 	hdr = (struct hpio_hdr *)buf;
+	if (unlikely(hdr->version != HPIO_HDR_VERSION)) {
+		pr_debug("%s: invalid hpio hdr version '0x%x'\n",
+			 __func__, hdr->version);
+		return -EINVAL;
+	}
+
+
+	skb = ring->skb_array[ring->head];	/* use head as buffer */
+	ring_write_next(ring);			/* protect the skb */
 
 	if ((hdr->pktlen + sizeof(struct hpio_hdr)) > count) {
 		copylen = count - sizeof(struct hpio_hdr);
@@ -449,6 +460,11 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 		pskb = &ring->skb_tx_array[ring->head];
 
 		hdr = (struct hpio_hdr *) iter->iov[i].iov_base;
+		if (unlikely(hdr->version != HPIO_HDR_VERSION)) {
+			pr_debug("%s: invalid hpio hdr version '0x%x'\n",
+				 __func__, hdr->version);
+			return -EINVAL;
+		}
 
 		if ((hdr->pktlen + sizeof(struct hpio_hdr)) >
 		    iter->iov[i].iov_len) {
