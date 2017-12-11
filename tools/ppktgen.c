@@ -26,7 +26,7 @@
 #define pr_err(fmt, ...) fprintf(stderr, "%s: " fmt, __func__, ##__VA_ARGS__)
 
 
-#include "../../kmod/hpio.h"	/* struct hpio_hdr */
+#include <hpio.h>
 
 
 #define MAX_CPU		64

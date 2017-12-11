@@ -11,7 +11,7 @@
 #include <net/netns/generic.h>
 #include <net/net_namespace.h>
 
-#include "hpio.h"
+#include <hpio.h>
 
 #undef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt

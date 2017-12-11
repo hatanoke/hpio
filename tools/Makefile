@@ -1,15 +1,16 @@
 
+CC = gcc
+INCLUDE := -I../include/
+LDFLAGS := -pthread
+CFLAGS := -g -Wall $(INCLUDE)
 
-subdirs = hub mgdump pipe ppktgen
+PROGNAME = hub pipe mgdump ppktgen
 
-all:
-	for i in $(subdirs); do \
-		echo; echo $i;	\
-		make -C $$i;	\
-	done
+all: $(PROGNAME)
+
+.c.o:
+	$(CC) $< -o $@
 
 clean:
-	for i in $(subdirs); do \
-		echo; echo $i;	\
-		make -C $$i clean;	\
-	done
+	rm -rf *.o
+	rm -rf $(PROGNAME)

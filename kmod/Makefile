@@ -4,6 +4,7 @@ VERBOSE = 0
 
 obj-m := hpio.o
 hpio-objs := hpio_main.o
+ccflags-y := -I$(src)/../include/
 
 all:
 	make -C $(KERNELSRCDIR) M=$(BUILD_DIR) V=$(VERBOSE) modules
