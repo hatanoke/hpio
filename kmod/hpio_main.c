@@ -195,12 +195,14 @@ static int hpio_init_tx_ring(struct hpio_ring *ring, int cpu,
 	ring->mask = HPIO_SLOT_NUM - 1;
 
 	for (i = 0; i < HPIO_SLOT_NUM; i++) {
-		ring->skb_array[i] = __alloc_skb(HPIO_PACKET_SIZE,
-						 GFP_KERNEL, SKB_ALLOC_FCLONE,
+		ring->skb_array[i] = __alloc_skb(HPIO_PACKET_SIZE
+						 + NET_SKB_PAD,
+						 GFP_NOWAIT, SKB_ALLOC_FCLONE,
 						 cpu_to_node(cpu));
 		if (!ring->skb_array[i])
 			return -ENOMEM;
 
+		skb_reserve(ring->skb_array[i], NET_SKB_PAD);
 		ring->skb_array[i]->dev = dev;
 		ring->skb_array[i]->queue_mapping = cpu;
 		ring->skb_array[i]->xmit_more = 1;	/* XXX */
@@ -463,7 +465,7 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 		if (unlikely(hdr->version != HPIO_HDR_VERSION)) {
 			pr_debug("%s: invalid hpio hdr version '0x%x'\n",
 				 __func__, hdr->version);
-			return -EINVAL;
+			continue;
 		}
 
 		if ((hdr->pktlen + sizeof(struct hpio_hdr)) >
@@ -473,6 +475,7 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 		} else {
 			copylen = hdr->pktlen;
 		}
+
 
 		*pskb = skb_clone(skb, GFP_ATOMIC);
 		if (!*pskb)
