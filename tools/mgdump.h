@@ -16,6 +16,8 @@
 #include <pthread.h>
 #include <signal.h>
 
+#include <hpio.h>
+
 #define MGC_HDRLEN          10
 #define MGC_SLOTLEN         2048
 #define INTERVAL_100USEC    100
