@@ -439,7 +439,7 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	int ret;
 	ssize_t retval = 0, r;
 	size_t count = iter->nr_segs;
-	u32 copylen, avail, i, copynum;
+	u32 avail, i, copynum;
 	struct file *filp = iocb->ki_filp;
 	struct sk_buff *skb, **pskb;
 	struct net_device *dev;
@@ -478,14 +478,12 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 		/* 2. retrive pkt data from iter buffer */
 		*pskb = skb_get(skb);
 		skb_trim(*pskb, 0);
-		skb_put(*pskb, copylen);
+		skb_put(*pskb, hdr.pktlen);
 		skb_set_mac_header(*pskb, 0);
 
 		r = copy_from_iter(skb_mac_header(*pskb), hdr.pktlen, iter);
 		if (r < hdr.pktlen) {
-			net_info_ratelimited("%s: invalid pkt len, "
-					     "hdr.pktlen = %ul, copied = %ld",
-					     __func__, hdr.pktlen, r);
+			kfree_skb(*pskb);
 			break;
 		}
 
