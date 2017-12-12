@@ -477,10 +477,8 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 		}
 
 
-		*pskb = skb_clone(skb, GFP_ATOMIC);
-		if (!*pskb)
-			return -ENOMEM;
-
+		*pskb = skb_get(skb);
+		skb_trim(*pskb, 0);
 		skb_put(*pskb, copylen);
 		skb_set_mac_header(*pskb, 0);
 
