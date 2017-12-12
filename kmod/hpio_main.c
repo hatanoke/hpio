@@ -437,14 +437,14 @@ static ssize_t hpio_write(struct file *filp, const char __user *buf,
 static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
 	int ret;
-	ssize_t retval = 0;
+	ssize_t retval = 0, r;
 	size_t count = iter->nr_segs;
 	u32 copylen, avail, i, copynum;
 	struct file *filp = iocb->ki_filp;
 	struct sk_buff *skb, **pskb;
 	struct net_device *dev;
 	struct netdev_queue *txq;
-	struct hpio_hdr *hdr;
+	struct hpio_hdr hdr;
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), tx);
 
@@ -457,33 +457,37 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 
 	/* first, write packets to skb ring buffers */
-	for (i = 0; i < copynum; i++) {
+	for (i = 0; i < avail; i++) {
+
 		skb = ring->skb_array[ring->head];
 		pskb = &ring->skb_tx_array[ring->head];
 
-		hdr = (struct hpio_hdr *) iter->iov[i].iov_base;
-		if (unlikely(hdr->version != HPIO_HDR_VERSION)) {
+		/* 1. retrieve hpio_hdr from iter buffer */
+		r = copy_from_iter(&hdr, sizeof(hdr), iter);
+		if (r < sizeof(struct hpio_hdr))
+			break;
+		if (unlikely(hdr.version != HPIO_HDR_VERSION)) {
 			pr_debug("%s: invalid hpio hdr version '0x%x'\n",
-				 __func__, hdr->version);
+				 __func__, hdr.version);
+			/* advance to next packet*/
+			iov_iter_advance(iter, hdr.pktlen);
+			i++;
 			continue;
 		}
 
-		if ((hdr->pktlen + sizeof(struct hpio_hdr)) >
-		    iter->iov[i].iov_len) {
-			copylen = iter->iov[i].iov_len -
-				sizeof(struct hpio_hdr);
-		} else {
-			copylen = hdr->pktlen;
-		}
-
-
+		/* 2. retrive pkt data from iter buffer */
 		*pskb = skb_get(skb);
 		skb_trim(*pskb, 0);
 		skb_put(*pskb, copylen);
 		skb_set_mac_header(*pskb, 0);
 
-		copy_from_user(skb_mac_header(*pskb), (char *)(hdr + 1),
-			       copylen);
+		r = copy_from_iter(skb_mac_header(*pskb), hdr.pktlen, iter);
+		if (r < hdr.pktlen) {
+			net_info_ratelimited("%s: invalid pkt len, "
+					     "hdr.pktlen = %ul, copied = %ld",
+					     __func__, hdr.pktlen, r);
+			break;
+		}
 
 		ring_write_next(ring);
 	}
