@@ -85,6 +85,7 @@ struct ppktgen_body {
 
 	bool rx_mode;	/* RX mode if true */
 	bool per_cpu_rx;	/* per CPU mode for Raw and UDP RX */
+	bool ts_mode;	/* output timestamp */
 
 	int ncpus;	/* number of cpus */
 	int nthreads;	/* number of threads */
@@ -409,6 +410,7 @@ void * ppktgen_rx_thread(void *arg)
 	int n, cnt;
 	char buf[MAX_BULKNUM][MAX_PKTLEN];
 	cpu_set_t target_cpu_set;
+	struct hpio_hdr *hdr;
 	struct ppktgen_thread *pt = (struct ppktgen_thread *)arg;
 	struct ppktgen_body *pbody = pt->pbody;
 	struct iovec iov[MAX_BULKNUM];
@@ -435,12 +437,30 @@ void * ppktgen_rx_thread(void *arg)
 			usleep(100);
 			continue;
 		}
+
 		if (cnt < 0) {
 			pr_err("readv() failed on cpu %d\n", pt->cpu);
 			exit (EXIT_FAILURE);
 		}
 
-		pt->pkt_count += cnt;
+		if (pbody->io_mode == IO_MODE_HPIO)
+			pt->pkt_count += cnt;
+		else
+			pt->pkt_count += 1;
+
+		if (pbody->ts_mode) {
+			if (pbody->io_mode == IO_MODE_HPIO) {
+				for (n = 0; n < cnt; n++) {
+					hdr = iov[n].iov_base;
+					printf("RX_TIMESTAMP:%ld\n",
+					       hdr->tstamp);
+				}
+			} else {
+				hdr = iov[n].iov_base;
+				printf("RX_TIMESTAMP:%ld\n",
+				       hdr->tstamp);
+			}
+		}
 	}
 
 	return NULL;
@@ -509,6 +529,7 @@ void usage(void)
 	printf("ppktgen usage:\n"
 	       "\t -i: path to hpio device\n"
 	       "\t -r: rx mode (rx at all CPU)(default is tx)\n"
+	       "\t -t: display timestamp (with rx mode)\n"
 	       "\t -m: packet i/o mode (hpio|raw|udp) default hpio\n"
 	       "\t -p: per CPU mode for raw/udp sockets: SO_INCOMING_CPU,"
 	       "(on|off) default on\n"
@@ -522,7 +543,7 @@ void usage(void)
 	       "\t -n: number of threads\n"
 	       "\t -b: number of bulked packets\n"
 	       "\t -c: number of executing writev() on each cpu\n"
-	       "\t -t: packet transmit interval (usec)\n"
+	       "\t -T: packet transmit interval (usec)\n"
 		);
 }
 
@@ -542,6 +563,7 @@ int main(int argc, char **argv)
 
 	memset(&ppktgen, 0, sizeof(ppktgen));
 	ppktgen.rx_mode = false;
+	ppktgen.ts_mode = false;
 	ppktgen.ncpus = count_online_cpus();
 	ppktgen.nthreads = 1;
 	ppktgen.bulk = 1;
@@ -551,7 +573,7 @@ int main(int argc, char **argv)
 	ppktgen.io_mode = IO_MODE_HPIO;
 	ppktgen.per_cpu_rx = true;
 
-	while ((ch = getopt(argc, argv, "i:rm:p:ad:s:D:S:l:M:n:b:c:t:"))
+	while ((ch = getopt(argc, argv, "i:rtm:p:ad:s:D:S:l:M:n:b:c:T:"))
 	       != -1) {
 		switch (ch) {
 		case 'i' :
@@ -561,6 +583,10 @@ int main(int argc, char **argv)
 
 		case 'r' :
 			ppktgen.rx_mode = true;
+			break;
+
+		case 't' :
+			ppktgen.ts_mode = true;
 			break;
 
 		case 'm' :
@@ -685,7 +711,7 @@ int main(int argc, char **argv)
 			}
 			break;
 
-		case 't' :
+		case 'T' :
 			/* packet transmit interval */
 			ppktgen.interval = atoi(optarg);
 			if (ppktgen.interval < -1) {
@@ -721,6 +747,7 @@ int main(int argc, char **argv)
 	pr_info("io_mode            %s\n", io_mode_str);
 	pr_info("rx_mode            %s\n", (ppktgen.rx_mode) ? "yes" : "no");
 	pr_info("per_cpu_rx         %s\n", (ppktgen.per_cpu_rx) ? "on" :"off");
+	pr_info("ts_mode            %s\n", (ppktgen.ts_mode) ? "on" : "off");
 
 	inet_ntop(AF_INET, &ppktgen.dst_ip, buf, sizeof(buf));
 	pr_info("dst IP:            %s\n", buf);
@@ -729,11 +756,11 @@ int main(int argc, char **argv)
 	pr_info("src IP:            %s\n", buf);
 
 	pr_info("dst MAC:           %02x:%02x:%02x:%02x:%02x:%02x\n",
-		dmacbuf[0], dmacbuf[2], dmacbuf[2],
+		dmacbuf[0], dmacbuf[1], dmacbuf[2],
 		dmacbuf[3], dmacbuf[4], dmacbuf[5]);
 
 	pr_info("src MAC:           %02x:%02x:%02x:%02x:%02x:%02x\n",
-		smacbuf[0], smacbuf[2], smacbuf[2],
+		smacbuf[0], smacbuf[1], smacbuf[2],
 		smacbuf[3], smacbuf[4], smacbuf[5]);
 
 	pr_info("packet size:       %d\n", ppktgen.len);
