@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/poll.h>
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <pthread.h>
@@ -28,10 +29,13 @@
 
 #define pr_info(fmt, ...) fprintf(stdout, "%s: " fmt, \
 				  __func__, ##__VA_ARGS__)
+
 #define pr_warn(fmt, ...) fprintf(stdout, "\x1b[1m\x1b[31m"	\
 				  "%s:WARN: " fmt "\x1b[0m",	\
 				  __func__, ##__VA_ARGS__)
-#define pr_err(fmt, ...) fprintf(stderr, "%s: " fmt, __func__, ##__VA_ARGS__)
+
+#define pr_err(fmt, ...) fprintf(stderr, "%s:ERR: " fmt,	\
+				 __func__, ##__VA_ARGS__)
 
 
 #include <hpio.h>
@@ -209,10 +213,9 @@ int get_hpio_socket(char *hpio_devpath)
 	return hpio_fd;
 }
 
-int get_raw_socket(int cpu, bool per_cpu_rx, char *dev)
+int get_raw_socket(int cpu, char *dev)
 {
 	int fd, ret;
-	socklen_t len;
 	struct sockaddr_ll sll;
 
 	fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -234,23 +237,13 @@ int get_raw_socket(int cpu, bool per_cpu_rx, char *dev)
 		return -1;
 	}
 
-	if (per_cpu_rx) {
-		len = sizeof(cpu);
-		ret = setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, len);
-		if (ret < 0) {
-			pr_err("failed to setsockopt SO_INCOMING_CPU\n");
-			perror("setsockopt");
-			return -1;
-		}
-	}
-
 	return fd;
 }
 
 int get_udp_socket(int cpu, bool per_cpu_rx, bool rx_mode,
 		   struct in_addr dst, int port)
 {
-	int fd, ret;
+	int fd, ret, val = 1;
 	socklen_t len;
 	struct sockaddr_in saddr;
 
@@ -262,11 +255,20 @@ int get_udp_socket(int cpu, bool per_cpu_rx, bool rx_mode,
 	}
 
 	if (rx_mode) {
-		/* bind for RX. Not bind for TX, because of RSS */
+		/* bind for RX and set SO_REUSEADDR for per_cpu_rx */
+
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+			       &val, sizeof(val)) < 0) {
+			pr_err("setsockopt SO_REUSEADDR failed\n");
+			perror("setsockopt");
+			return -1;
+		}
+
 		memset(&saddr, 0, sizeof(saddr));
 		saddr.sin_family = AF_INET;
 		saddr.sin_port = htons(port);
 		saddr.sin_addr.s_addr = INADDR_ANY;
+
 		ret = bind(fd, (struct sockaddr *)&saddr, sizeof(saddr));
 		if (ret < 0) {
 			pr_err("failed to bind udp socket\n");
@@ -320,7 +322,7 @@ int get_socket_fd(struct ppktgen_body *pb, struct ppktgen_thread *pt)
 				break;
 			}
 		}
-		fd = get_raw_socket(pt->cpu, pb->per_cpu_rx, dev);
+		fd = get_raw_socket(pt->cpu, dev);
 		break;
 
 	case IO_MODE_UDP :
@@ -426,6 +428,7 @@ void * ppktgen_rx_thread(void *arg)
 	struct ppktgen_thread *pt = (struct ppktgen_thread *)arg;
 	struct ppktgen_body *pbody = pt->pbody;
 	struct iovec iov[MAX_BULKNUM];
+	struct pollfd x = { .fd = pt->fd, .events = POLLIN };
 
 
 	/* pin this thread to a cpu */
@@ -443,6 +446,14 @@ void * ppktgen_rx_thread(void *arg)
 	while (1) {
 		if (caught_signal)
 			break;
+
+		if (poll(&x, 1, 1000) < 0) {
+			pr_err("poll failed on cpu %d\n", pt->cpu);
+			perror("poll");
+			return NULL;
+		}
+		if (!x.revents & POLLIN)
+			continue;
 
 		cnt = readv(pt->fd, iov, pbody->bulk);
 		if (cnt == 0) {
@@ -764,13 +775,30 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (ppktgen.pp_mode == PP_MODE_RX) {
+	if (ppktgen.pp_mode == PP_MODE_RX && ppktgen.pp_mode == IO_MODE_HPIO) {
 		/* In RX mode, ppktgen receives packets on all CPUs
 		 * because hpio (currently ) does not support all
 		 * packets to specified CPU(s).
 		 */
-		pr_warn("When RX mode, ppktgen uses all CPUs\n");
+		pr_warn("When RX mode with hpio, ppktgen uses all CPUs\n");
 		ppktgen.nthreads = ppktgen.ncpus;
+	}
+
+	if (ppktgen.pp_mode == PP_MODE_RX && ppktgen.io_mode == IO_MODE_RAW) {
+		pr_warn("When RX mode with raw, one rx thread is allowed\n");
+		ppktgen.nthreads = 1;
+	}
+
+	if (ppktgen.pp_mode == PP_MODE_RX && ppktgen.io_mode == IO_MODE_UDP) {
+		if (ppktgen.per_cpu_rx) {
+			pr_warn("When RX mode with udp, "
+				"and per_cpu_rx is on, all CPUs are used\n");
+			ppktgen.nthreads = ppktgen.ncpus;
+		} else {
+			pr_warn("When RX mode with udp, "
+				"and per_cpu_rx if off, only 1 cpu is used\n");
+			ppktgen.nthreads = 1;
+		}
 	}
 
 	if (ppktgen.io_mode == IO_MODE_RAW || ppktgen.io_mode == IO_MODE_UDP) {
@@ -778,6 +806,10 @@ int main(int argc, char **argv)
 		ppktgen.bulk = 1;
 	}
 
+	if (ppktgen.ts_mode == TS_MODE_HW && ppktgen.io_mode != IO_MODE_HPIO) {
+		pr_err("ts mode 'hw' must be with i/o mode 'hpio'\n");
+		return -1;
+	}
 
 	/* print parameters */
 	pr_info("============ Parameters ============\n");
@@ -881,7 +913,6 @@ int main(int argc, char **argv)
 	/* thread join */
 	for (n = 0; n < ppktgen.nthreads; n++)
 		pthread_join(ppktgen.pt[n].tid, NULL);
-
 
 	pthread_join(pkt_count_tid, NULL);
 
