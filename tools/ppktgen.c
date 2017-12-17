@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <pthread.h>
@@ -42,10 +43,19 @@
 #define UDP_DST_PORT	60000
 #define UDP_SRC_PORT	60001
 
+/* TX/RX mode */
+#define PP_MODE_TX	1
+#define PP_MODE_RX	2
+
 /* ppktgen i/o mode */
 #define IO_MODE_HPIO	1
 #define IO_MODE_RAW	2
 #define IO_MODE_UDP	3
+
+/* timestamp mode */
+#define TS_MODE_NONE	0
+#define TS_MODE_HW	1
+#define TS_MODE_SW	2
 
 
 /* ppktgen thread structure */
@@ -81,11 +91,11 @@ struct ppktgen_body {
 	unsigned short	udp_dst;	/* udp dst port */
 	unsigned short	udp_src;	/* udp src port */
 
+	int pp_mode;	/* ppktgen mode, tx or rx */
 	int io_mode;	/* packet i/o mode */
+	int ts_mode;	/* output timestamp */
 
-	bool rx_mode;	/* RX mode if true */
 	bool per_cpu_rx;	/* per CPU mode for Raw and UDP RX */
-	bool ts_mode;	/* output timestamp */
 
 	int ncpus;	/* number of cpus */
 	int nthreads;	/* number of threads */
@@ -314,7 +324,8 @@ int get_socket_fd(struct ppktgen_body *pb, struct ppktgen_thread *pt)
 		break;
 
 	case IO_MODE_UDP :
-		fd = get_udp_socket(pt->cpu, pb->per_cpu_rx, pb->rx_mode,
+		fd = get_udp_socket(pt->cpu, pb->per_cpu_rx,
+				    (pt->pbody->pp_mode == PP_MODE_RX),
 				    pb->dst_ip, UDP_DST_PORT);
 		break;
 	default :
@@ -410,6 +421,7 @@ void * ppktgen_rx_thread(void *arg)
 	int n, cnt;
 	char buf[MAX_BULKNUM][MAX_PKTLEN];
 	cpu_set_t target_cpu_set;
+	struct timeval tv;
 	struct hpio_hdr *hdr;
 	struct ppktgen_thread *pt = (struct ppktgen_thread *)arg;
 	struct ppktgen_body *pbody = pt->pbody;
@@ -448,18 +460,26 @@ void * ppktgen_rx_thread(void *arg)
 		else
 			pt->pkt_count += 1;
 
-		if (pbody->ts_mode) {
-			if (pbody->io_mode == IO_MODE_HPIO) {
-				for (n = 0; n < cnt; n++) {
-					hdr = iov[n].iov_base;
-					printf("RX_TIMESTAMP:%ld\n",
-					       hdr->tstamp);
-				}
-			} else {
+		switch (pbody->ts_mode) {
+		case TS_MODE_NONE:
+			break;
+		case TS_MODE_SW :
+			if (gettimeofday(&tv, NULL) < 0) {
+				pr_err("gettimeofday failed on cpu %d\n",
+					pt->cpu);
+				perror("gettimeofday");
+				return NULL;
+			}
+			printf("SW_TIMESTAMP:%ld\n",
+			       tv.tv_sec * 1000000+ tv.tv_usec);
+			break;
+		case TS_MODE_HW :
+			for (n = 0; n < cnt; n++) {
 				hdr = iov[n].iov_base;
-				printf("RX_TIMESTAMP:%ld\n",
+				printf("HW_TIMESTAMP:%ld\n",
 				       hdr->tstamp);
 			}
+			break;
 		}
 	}
 
@@ -528,11 +548,11 @@ void usage(void)
 {
 	printf("ppktgen usage:\n"
 	       "\t -i: path to hpio device\n"
-	       "\t -r: rx mode (rx at all CPU)(default is tx)\n"
-	       "\t -t: display timestamp (with rx mode)\n"
-	       "\t -m: packet i/o mode (hpio|raw|udp) default hpio\n"
-	       "\t -p: per CPU mode for raw/udp sockets: SO_INCOMING_CPU,"
-	       "(on|off) default on\n"
+	       "\t -m: ppktgen mode, (rx|tx)\n"
+	       "\t -t: tstamp mode (none|hw|sw). default is none\n"
+	       "\t -o: packet i/o mode (hpio|raw|udp) default hpio\n"
+	       "\t -p: per CPU rx mode for raw/udp sockets"
+	       "(on|off). default is on\n"
 	       "\t -a: print pps stat on each CPU\n"
 	       "\t -d: destination IPv4 address\n"
 	       "\t -s: source IPv4 address\n"
@@ -552,7 +572,7 @@ int main(int argc, char **argv)
 
 	int ch, n, cpu, rc;
 	int dmacbuf[ETH_ALEN], smacbuf[ETH_ALEN];
-	char *io_mode_str = "hpio";
+	char *pp_mode_str = NULL, *io_mode_str = "hpio", *ts_mode_str = "none";
 	char buf[16];		/* for printing parameters to stdout */
 	pthread_t pkt_count_tid;	/* pthread id for pkt count thread */
 	unsigned int use_cpu = 0, mask;
@@ -562,18 +582,18 @@ int main(int argc, char **argv)
 	memset(smacbuf, 0, sizeof(smacbuf));
 
 	memset(&ppktgen, 0, sizeof(ppktgen));
-	ppktgen.rx_mode = false;
-	ppktgen.ts_mode = false;
+	ppktgen.pp_mode = 0; 
+	ppktgen.io_mode = IO_MODE_HPIO;
+	ppktgen.ts_mode = TS_MODE_NONE;
 	ppktgen.ncpus = count_online_cpus();
 	ppktgen.nthreads = 1;
 	ppktgen.bulk = 1;
 	ppktgen.len = 60;
 	ppktgen.udp_dst = htons(UDP_DST_PORT);
 	ppktgen.udp_src = htons(UDP_SRC_PORT);
-	ppktgen.io_mode = IO_MODE_HPIO;
 	ppktgen.per_cpu_rx = true;
 
-	while ((ch = getopt(argc, argv, "i:rtm:p:ad:s:D:S:l:M:n:b:c:T:"))
+	while ((ch = getopt(argc, argv, "i:m:o:t:p:ad:s:D:S:l:M:n:b:c:T:"))
 	       != -1) {
 		switch (ch) {
 		case 'i' :
@@ -581,29 +601,46 @@ int main(int argc, char **argv)
 			ppktgen.devpath = optarg;
 			break;
 
-		case 'r' :
-			ppktgen.rx_mode = true;
-			break;
-
-		case 't' :
-			ppktgen.ts_mode = true;
-			break;
-
 		case 'm' :
+			pp_mode_str = optarg;
+			if (strncmp(optarg, "rx", 2) == 0)
+				ppktgen.pp_mode = PP_MODE_RX;
+			else if (strncmp(optarg, "tx", 2) == 0)
+				ppktgen.pp_mode = PP_MODE_TX;
+			else {
+				pr_err("invalid ppktgen mode '%s'\n", optarg);
+				return -1;
+			}
+			break;
+
+		case 'o' :
+			io_mode_str = optarg;
 			if (strncmp(optarg, "hpio", 4) == 0)
 				ppktgen.io_mode = IO_MODE_HPIO;
-			else if (strncmp(optarg, "raw", 3) == 0) {
+			else if (strncmp(optarg, "raw", 3) == 0)
 				ppktgen.io_mode = IO_MODE_RAW;
-				io_mode_str = "raw";
-			}
-			else if (strncmp(optarg, "udp", 3) == 0) {
+			else if (strncmp(optarg, "udp", 3) == 0)
 				ppktgen.io_mode = IO_MODE_UDP;
-				io_mode_str = "udp";
-			}else {
+			else {
 				pr_err("invalid i/o mode '%s'\n", optarg);
 				return -1;
 			}
 			break;
+
+		case 't' :
+			ts_mode_str = optarg;
+			if (strncmp(optarg, "none", 4) == 0)
+				ppktgen.ts_mode = TS_MODE_NONE;
+			else if (strncmp(optarg, "hw", 2) == 0)
+				ppktgen.ts_mode = TS_MODE_HW;
+			else if (strncmp(optarg, "sw", 2) == 0)
+				ppktgen.ts_mode = TS_MODE_SW;
+			else {
+				pr_err("invalid tstmap mode '%s'\n", optarg);
+				return -1;
+			}
+			break;
+
 		case 'p' :
 			if (strncmp(optarg, "on", 2) == 0)
 				ppktgen.per_cpu_rx = true;
@@ -614,6 +651,7 @@ int main(int argc, char **argv)
 				return -1;
 			}
 			break;
+
 		case 'a' :
 			ppktgen.print_all_cpu_pps = 1;
 			break;
@@ -726,7 +764,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (ppktgen.rx_mode) {
+	if (ppktgen.pp_mode == PP_MODE_RX) {
 		/* In RX mode, ppktgen receives packets on all CPUs
 		 * because hpio (currently ) does not support all
 		 * packets to specified CPU(s).
@@ -744,10 +782,11 @@ int main(int argc, char **argv)
 	/* print parameters */
 	pr_info("============ Parameters ============\n");
 	pr_info("dev:               %s\n", ppktgen.devpath);
+	pr_info("pp_mode            %s\n", pp_mode_str);
 	pr_info("io_mode            %s\n", io_mode_str);
-	pr_info("rx_mode            %s\n", (ppktgen.rx_mode) ? "yes" : "no");
+	pr_info("ts_mode            %s\n", ts_mode_str);
+
 	pr_info("per_cpu_rx         %s\n", (ppktgen.per_cpu_rx) ? "on" :"off");
-	pr_info("ts_mode            %s\n", (ppktgen.ts_mode) ? "on" : "off");
 
 	inet_ntop(AF_INET, &ppktgen.dst_ip, buf, sizeof(buf));
 	pr_info("dst IP:            %s\n", buf);
@@ -804,19 +843,25 @@ int main(int argc, char **argv)
 		pr_info("Create thread %d on cpu %d\n",
 			ppktgen.pt[n].thn, ppktgen.pt[n].cpu);
 
-		if (!ppktgen.rx_mode) {
+		switch (ppktgen.pp_mode) {
+		case PP_MODE_TX:
 			rc = pthread_create(&ppktgen.pt[n].tid, NULL,
 					    ppktgen_tx_thread, &ppktgen.pt[n]);
-		} else {
+			break;
+
+		case PP_MODE_RX:
 			rc = pthread_create(&ppktgen.pt[n].tid, NULL,
 					    ppktgen_rx_thread, &ppktgen.pt[n]);
-		}
+			break;
 
+		default:
+			pr_err("invalid ppktgen mode\n");
+			return -1;
+		}
 		if (rc < 0) {
 			perror("pthread_create");
 			exit(EXIT_FAILURE);
 		}
-
 	}
 
 	/* start packet count thread */
