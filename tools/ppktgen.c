@@ -559,11 +559,10 @@ void usage(void)
 {
 	printf("ppktgen usage:\n"
 	       "\t -i: path to hpio device\n"
-	       "\t -m: ppktgen mode, (rx|tx)\n"
-	       "\t -t: tstamp mode (none|hw|sw). default is none\n"
-	       "\t -o: packet i/o mode (hpio|raw|udp) default hpio\n"
-	       "\t -p: per CPU rx mode for raw/udp sockets"
-	       "(on|off). default is on\n"
+	       "\t -m: ppktgen mode (rx|tx)\n"
+	       "\t -t: tstamp mode (none|hw|sw), default is none\n"
+	       "\t -o: packet i/o mode (hpio|raw|udp), default is hpio\n"
+	       "\t -p: per CPU rx for udp i/o (on|off), default is on\n"
 	       "\t -a: print pps stat on each CPU\n"
 	       "\t -d: destination IPv4 address\n"
 	       "\t -s: source IPv4 address\n"
@@ -777,8 +776,8 @@ int main(int argc, char **argv)
 
 	if (ppktgen.pp_mode == PP_MODE_RX && ppktgen.pp_mode == IO_MODE_HPIO) {
 		/* In RX mode, ppktgen receives packets on all CPUs
-		 * because hpio (currently ) does not support all
-		 * packets to specified CPU(s).
+		 * because hpio (currently) can not receive packets to
+		 * multiple CPUs (queues) on one CPU.
 		 */
 		pr_warn("When RX mode with hpio, ppktgen uses all CPUs\n");
 		ppktgen.nthreads = ppktgen.ncpus;
