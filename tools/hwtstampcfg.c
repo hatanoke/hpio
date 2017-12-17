@@ -43,7 +43,7 @@ void show(struct param p)
 		return;
 	}
 
-	printf("dev %s tx %d rx %d", p.ifname,
+	printf("dev %s tx %d rx %d\n", p.ifname,
 	       config.tx_type, config.rx_filter);
 }
 
