@@ -774,7 +774,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (ppktgen.pp_mode == PP_MODE_RX && ppktgen.pp_mode == IO_MODE_HPIO) {
+	if (ppktgen.pp_mode == PP_MODE_RX && ppktgen.io_mode == IO_MODE_HPIO) {
 		/* In RX mode, ppktgen receives packets on all CPUs
 		 * because hpio (currently) can not receive packets to
 		 * multiple CPUs (queues) on one CPU.
