@@ -9,6 +9,10 @@ ccflags-y := -I$(src)/../include/
 all:
 	make -C $(KERNELSRCDIR) M=$(BUILD_DIR) V=$(VERBOSE) modules
 
+install:
+	install -m 644 hpio.ko /lib/modules/`uname -r`/kernel/net/
+	depmod -A
+
 clean:
 	make -C $(KERNELSRCDIR) M=$(BUILD_DIR) clean
 

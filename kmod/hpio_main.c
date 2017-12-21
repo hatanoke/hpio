@@ -7,6 +7,8 @@
 #include <linux/wait.h>
 #include <linux/miscdevice.h>
 #include <linux/pid.h>
+#include <linux/if_ether.h>
+#include <uapi/linux/ip.h>
 #include <net/genetlink.h>
 #include <net/netns/generic.h>
 #include <net/net_namespace.h>
@@ -23,6 +25,15 @@ MODULE_VERSION(HPIO_VERSION);
 MODULE_AUTHOR("haeena.net");
 MODULE_DESCRIPTION("haeena packet i/o");
 MODULE_LICENSE("GPL");
+
+
+/* Specific ToS Fieled value:
+ * - If this value is configured (not 0), hpio consumes packets having
+ * the value in their ToS fields.
+ */
+static unsigned int tos_consumed __read_mostly = 0;
+module_param_named(tos_value, tos_consumed, uint, 0444);
+MODULE_PARM_DESC(tos_value, "ToS value consumed by hpio");
 
 
 
@@ -222,6 +233,21 @@ static void hpio_destroy_tx_ring(struct hpio_ring *ring)
 
 /* rx register handler */
 
+static int hpio_check_tos(struct sk_buff *skb, int tos)
+{
+	struct ethhdr *eth;
+	struct iphdr *ip;
+
+	eth = eth_hdr(skb);
+	if (eth->h_proto == htons(ETH_P_IP)) {
+		ip = (struct iphdr *)(eth + 1);
+		if (ip->tos == tos)
+			return 1;
+	}
+
+	return 0;
+}
+
 static struct hpio_dev *hpio_dev_get_rcu(const struct net_device *d)
 {
 	return rcu_dereference(d->rx_handler_data);
@@ -232,6 +258,10 @@ rx_handler_result_t hpio_handle_frame(struct sk_buff **pskb)
 	struct sk_buff *skb = *pskb;
 	struct hpio_dev *hpdev = hpio_dev_get_rcu(skb->dev);
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), rx);
+
+	if (tos_consumed && !hpio_check_tos(skb, tos_consumed)) {
+		return RX_HANDLER_PASS;
+	}
 
 	if (ring_full(ring))
 		goto done;
@@ -739,6 +769,11 @@ static int __init hpio_init_module(void)
 {
 	int rc;
 	pr_info("load hpio (v%s)\n", HPIO_VERSION);
+
+	if (tos_consumed) {
+		pr_info("Packets with ToS value 0x%02X are handled by hpio\n",
+			tos_consumed);
+	}
 
 	rc = register_pernet_subsys(&hpio_net_ops);
 	if (rc != 0) {
