@@ -107,6 +107,7 @@ struct ppktgen_body {
 	int len;	/* length of the packet */
 	int bulk;	/* number of bulked packets at one writev() */
 	int interval;	/* usec interval */
+	int timeout;	/* timeout (sec) */
 
 	unsigned long count;	/* count of excuting writev() */
 
@@ -531,6 +532,11 @@ void * ppktgen_count_thread(void *arg)
 		}
 		printf("\n");
 
+		if (pbody->timeout >= 1) {
+			pbody->timeout--;
+			if (pbody->timeout == 0)
+				caught_signal = 1;
+		}
 	}
 
 	return NULL;
@@ -573,7 +579,8 @@ void usage(void)
 	       "\t -n: number of threads\n"
 	       "\t -b: number of bulked packets\n"
 	       "\t -c: number of executing writev() on each cpu\n"
-	       "\t -T: packet transmit interval (usec)\n"
+	       "\t -I: packet transmit interval (usec)\n"
+	       "\t -T: timeout (sec)\n"
 		);
 }
 
@@ -603,7 +610,7 @@ int main(int argc, char **argv)
 	ppktgen.udp_src = htons(UDP_SRC_PORT);
 	ppktgen.per_cpu_rx = true;
 
-	while ((ch = getopt(argc, argv, "i:m:o:t:p:ad:s:D:S:l:M:n:b:c:T:"))
+	while ((ch = getopt(argc, argv, "i:m:o:t:p:ad:s:D:S:l:M:n:b:c:I:T:"))
 	       != -1) {
 		switch (ch) {
 		case 'i' :
@@ -759,13 +766,18 @@ int main(int argc, char **argv)
 			}
 			break;
 
-		case 'T' :
+		case 'I' :
 			/* packet transmit interval */
 			ppktgen.interval = atoi(optarg);
 			if (ppktgen.interval < -1) {
 				pr_err("interval must be > 0\n");
 				return -1;
 			}
+			break;
+
+		case 'T' :
+			/* timeout (sec) */
+			ppktgen.timeout = atoi(optarg);
 			break;
 
 		default:
@@ -839,6 +851,7 @@ int main(int argc, char **argv)
 	pr_info("CPU mask:          0x%x\n", use_cpu);
 	pr_info("count of writev(): %lu\n", ppktgen.count);
 	pr_info("transmit interval: %d\n", ppktgen.interval);
+	pr_info("timeout:           %d\n", ppktgen.timeout);
 	pr_info("====================================\n");
 
 
