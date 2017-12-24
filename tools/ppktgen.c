@@ -114,6 +114,9 @@ struct ppktgen_body {
 	int print_all_cpu_pps;
 
 	struct ppktgen_thread pt[MAX_CPU];
+
+	/* pkt count thread */
+	pthread_t pkt_count_tid;
 };
 
 
@@ -498,15 +501,34 @@ void * ppktgen_rx_thread(void *arg)
 	return NULL;
 }
 
+int count_online_cpus(void)
+{
+	cpu_set_t cpu_set;
+
+	if (sched_getaffinity(0, sizeof(cpu_set_t), &cpu_set) == 0)
+		return CPU_COUNT(&cpu_set);
+
+	return -1;
+}
+
 /* thread counting packets */
 void * ppktgen_count_thread(void *arg)
 {
-	int n;
+	int n, cpu = count_online_cpus() - 1;
+	cpu_set_t target_cpu_set;
 	unsigned long pps, before[MAX_CPU], after[MAX_CPU];
 	struct ppktgen_body *pbody = arg;
 
 	memset(before, 0, sizeof(unsigned long) + MAX_CPU);
 	memset(after, 0, sizeof(unsigned long) + MAX_CPU);
+
+	/* pin this count thread to last CPU core to prevent this thread
+	 * from blocked by other tx/rx threads */
+	CPU_ZERO(&target_cpu_set);
+	CPU_SET(cpu, &target_cpu_set);
+	pthread_setaffinity_np(pbody->pkt_count_tid,
+			       sizeof(cpu_set_t), &target_cpu_set);
+	pr_info("ppktgen_count_thread on CPU %d\n", cpu);
 
 	while (1) {
 		if (caught_signal)
@@ -548,16 +570,6 @@ void sig_handler(int sig)
 		caught_signal = 1;
 }
 
-int count_online_cpus(void)
-{
-	cpu_set_t cpu_set;
-
-	if (sched_getaffinity(0, sizeof(cpu_set_t), &cpu_set) == 0)
-		return CPU_COUNT(&cpu_set);
-
-	return -1;
-}
-
 
 
 
@@ -591,8 +603,7 @@ int main(int argc, char **argv)
 	int dmacbuf[ETH_ALEN], smacbuf[ETH_ALEN];
 	char *pp_mode_str = NULL, *io_mode_str = "hpio", *ts_mode_str = "none";
 	char buf[16];		/* for printing parameters to stdout */
-	pthread_t pkt_count_tid;	/* pthread id for pkt count thread */
-	unsigned int use_cpu = 0, mask;
+	unsigned long use_cpu = 0, mask;
 	struct ppktgen_body ppktgen;
 
 	memset(dmacbuf, 0, sizeof(dmacbuf));
@@ -729,7 +740,7 @@ int main(int argc, char **argv)
 
 		case 'M' :
 			/* CPU mask to specify CPUs to run threads */
-			rc = sscanf(optarg, "%x", &use_cpu);
+			rc = sscanf(optarg, "%lx", &use_cpu);
 			if (rc < 1) {
 				pr_err("invalid cpu mask %s\n", optarg);
 				return -1;
@@ -848,7 +859,7 @@ int main(int argc, char **argv)
 	pr_info("packet size:       %d\n", ppktgen.len);
 	pr_info("number of bulk:    %d\n", ppktgen.bulk);
 	pr_info("number of threads: %d\n", ppktgen.nthreads);
-	pr_info("CPU mask:          0x%x\n", use_cpu);
+	pr_info("CPU mask:          0x%lx\n", use_cpu);
 	pr_info("count of writev(): %lu\n", ppktgen.count);
 	pr_info("transmit interval: %d\n", ppktgen.interval);
 	pr_info("timeout:           %d\n", ppktgen.timeout);
@@ -909,7 +920,7 @@ int main(int argc, char **argv)
 	}
 
 	/* start packet count thread */
-	rc = pthread_create(&pkt_count_tid, NULL, ppktgen_count_thread,
+	rc = pthread_create(&ppktgen.pkt_count_tid, NULL, ppktgen_count_thread,
 			    &ppktgen);
 	if (rc < 0) {
 		perror("pthread_create");
@@ -926,7 +937,7 @@ int main(int argc, char **argv)
 	for (n = 0; n < ppktgen.nthreads; n++)
 		pthread_join(ppktgen.pt[n].tid, NULL);
 
-	pthread_join(pkt_count_tid, NULL);
+	pthread_join(ppktgen.pkt_count_tid, NULL);
 
 	return 0;
 }
