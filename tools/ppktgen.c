@@ -400,7 +400,7 @@ void * ppktgen_tx_thread(void *arg)
 		if (cnt < 0) {
 			pr_err("writev() failed on cpu %d\n", pt->cpu);
 			perror("writev");
-			exit (EXIT_FAILURE);
+			goto out;
 		}
 
 		if (pbody->io_mode == IO_MODE_HPIO)
@@ -417,8 +417,8 @@ void * ppktgen_tx_thread(void *arg)
 		if (pbody->interval)
 			usleep(pbody->interval);
 	}
-
-	return NULL;
+out:
+	pthread_exit(NULL);
 }
 
 /* ppktgen rx thread body on a cpu */
@@ -483,7 +483,7 @@ void * ppktgen_rx_thread(void *arg)
 				pr_err("gettimeofday failed on cpu %d\n",
 					pt->cpu);
 				perror("gettimeofday");
-				return NULL;
+				goto out;
 			}
 			printf("SW_TIMESTAMP:%ld\n",
 			       tv.tv_sec * 1000000+ tv.tv_usec);
@@ -497,8 +497,8 @@ void * ppktgen_rx_thread(void *arg)
 			break;
 		}
 	}
-
-	return NULL;
+out:
+	pthread_exit(NULL);
 }
 
 int count_online_cpus(void)
@@ -561,7 +561,7 @@ void * ppktgen_count_thread(void *arg)
 		}
 	}
 
-	return NULL;
+	pthread_exit(NULL);
 }
 
 void sig_handler(int sig)
