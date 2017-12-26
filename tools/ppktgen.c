@@ -47,6 +47,8 @@
 #define UDP_DST_PORT	60000
 #define UDP_SRC_PORT	60001
 
+#define MAX_ZERO_COUNT 1000000
+
 /* TX/RX mode */
 #define PP_MODE_TX	1
 #define PP_MODE_RX	2
@@ -307,7 +309,7 @@ int get_udp_socket(int cpu, bool per_cpu_rx, bool rx_mode,
 	return fd;
 }
 	
-int get_socket_fd(struct ppktgen_body *pb, struct ppktgen_thread *pt)
+int get_fd(struct ppktgen_body *pb, struct ppktgen_thread *pt)
 {
 	int fd = -1, n;
 	char *dev = NULL;
@@ -342,11 +344,30 @@ int get_socket_fd(struct ppktgen_body *pb, struct ppktgen_thread *pt)
 	return fd;
 }
 
+void close_fd(struct ppktgen_body *pb)
+{
+	int n;
+
+	switch(pb->io_mode) {
+	case IO_MODE_HPIO :
+		close(hpio_fd);
+		break;
+	case IO_MODE_RAW :
+	case IO_MODE_UDP :
+		for (n = 0; n < pb->nthreads; n++)
+			close(pb->pt[n].fd);
+		break;
+	}
+}
+
 
 /* ppktgen tx thread body on a cpu */
 void * ppktgen_tx_thread(void *arg)
 {
+
+
 	int n, cnt;
+	unsigned int zero_count = 0;
 	cpu_set_t target_cpu_set;
 	struct ppktgen_thread *pt = (struct ppktgen_thread *)arg;
 	struct ppktgen_body *pbody = pt->pbody;
@@ -397,8 +418,19 @@ void * ppktgen_tx_thread(void *arg)
 
 		cnt = writev(pt->fd, iov, pbody->bulk);
 
+		if (cnt == 0) {
+			zero_count++;
+			if (zero_count > MAX_ZERO_COUNT) {
+				pr_err("writev on CPU%d returns 0 %d times.\n",
+				       pt->cpu, MAX_ZERO_COUNT);
+				goto out;
+			}
+		} else
+			zero_count = 0;
+
 		if (cnt < 0) {
-			pr_err("writev() failed on cpu %d\n", pt->cpu);
+			pr_err("wrtitev failed on cpu %d, returns %d\n",
+			       pt->cpu, cnt);
 			perror("writev");
 			goto out;
 		}
@@ -804,6 +836,7 @@ int main(int argc, char **argv)
 		 */
 		pr_warn("When RX mode with hpio, ppktgen uses all CPUs\n");
 		ppktgen.nthreads = ppktgen.ncpus;
+		use_cpu = 0;
 	}
 
 	if (ppktgen.pp_mode == PP_MODE_RX && ppktgen.io_mode == IO_MODE_RAW) {
@@ -816,6 +849,7 @@ int main(int argc, char **argv)
 			pr_warn("When RX mode with udp, "
 				"and per_cpu_rx is on, all CPUs are used\n");
 			ppktgen.nthreads = ppktgen.ncpus;
+			use_cpu = 0;
 		} else {
 			pr_warn("When RX mode with udp, "
 				"and per_cpu_rx if off, only 1 cpu is used\n");
@@ -885,6 +919,8 @@ int main(int argc, char **argv)
 
 			/* in next loop, start at next bit */
 			mask <<= 1;
+			if (mask == 0)
+				mask = 1;
 		} else {
 			cpu = n;
 		}
@@ -893,7 +929,10 @@ int main(int argc, char **argv)
 		ppktgen.pt[n].cpu = cpu;
 		ppktgen.pt[n].pbody = &ppktgen;
 		ppktgen.pt[n].count = ppktgen.count;
-		ppktgen.pt[n].fd = get_socket_fd(&ppktgen, &ppktgen.pt[n]);
+		ppktgen.pt[n].fd = get_fd(&ppktgen, &ppktgen.pt[n]);
+		if (ppktgen.pt[n].fd < 0) {
+			return -1;
+		}
 
 		pr_info("Create thread %d on cpu %d\n",
 			ppktgen.pt[n].thn, ppktgen.pt[n].cpu);
@@ -938,6 +977,8 @@ int main(int argc, char **argv)
 		pthread_join(ppktgen.pt[n].tid, NULL);
 
 	pthread_join(ppktgen.pkt_count_tid, NULL);
+
+	close_fd(&ppktgen);
 
 	return 0;
 }
