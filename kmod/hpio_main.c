@@ -8,6 +8,8 @@
 #include <linux/miscdevice.h>
 #include <linux/pid.h>
 #include <linux/if_ether.h>
+#include <linux/wait.h>
+#include <linux/poll.h>
 #include <uapi/linux/ip.h>
 #include <net/genetlink.h>
 #include <net/netns/generic.h>
@@ -25,7 +27,6 @@ MODULE_VERSION(HPIO_VERSION);
 MODULE_AUTHOR("haeena.net");
 MODULE_DESCRIPTION("haeena packet i/o");
 MODULE_LICENSE("GPL");
-
 
 /* Specific ToS Fieled value:
  * - If this value is configured (not 0), hpio consumes packets having
@@ -56,6 +57,10 @@ bool netdev_is_rx_handler_busy(struct net_device *dev)
 #define packet_copy_len(pktlen, buflen) \
 	buflen > pktlen + sizeof(struct hpio_hdr) ? \
 	pktlen : buflen - sizeof(struct hpio_hdr)
+
+
+/* waitqueue for poll */
+static DECLARE_WAIT_QUEUE_HEAD(hpio_wait);
 
 
 /* packet buffer ring structure */
@@ -575,6 +580,18 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	return retval;	/* retrun num of xmitted packets */
 }
 
+static unsigned int hpio_poll(struct file *file, poll_table *wait)
+{
+	struct hpio_dev *hpdev = (struct hpio_dev *)file->private_data;
+	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), rx);
+
+	poll_wait(file, &hpio_wait, wait);
+	if (!ring_empty(ring))
+		return POLLIN | POLLRDNORM;
+
+	return 0;
+}
+
 static int
 hpio_release(struct inode *inode, struct file *filp)
 {
@@ -596,6 +613,7 @@ static struct file_operations hpio_fops = {
 	.read_iter	= hpio_read_iter,
 	.write		= hpio_write,
 	.write_iter	= hpio_write_iter,
+	.poll		= hpio_poll,
 	.release	= hpio_release,
 };
 

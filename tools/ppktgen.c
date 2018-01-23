@@ -496,6 +496,7 @@ void * ppktgen_rx_thread(void *arg)
 			usleep(100);
 			continue;
 		}
+			
 
 		if (cnt < 0) {
 			pr_err("readv() failed on cpu %d\n", pt->cpu);
