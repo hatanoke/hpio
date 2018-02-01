@@ -10,10 +10,13 @@
 #include <linux/if_ether.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
+#include <linux/socket.h>
 #include <uapi/linux/ip.h>
 #include <net/genetlink.h>
 #include <net/netns/generic.h>
 #include <net/net_namespace.h>
+#include <net/sock.h>
+
 
 #include <hpio.h>
 
@@ -89,8 +92,17 @@ struct hpio_dev {
 	struct hpio_ring	*tx_rings;
 
 	pid_t pid;	/* pid of the process open this hpio device */
+
+	atomic_t	refcnt;	/* refrenced by hpio_sock */
 };
 #define hpio_get_ring(h, idx, di) &((h)->di##_rings[idx])
+
+
+/* hpio socket structure */
+struct hpio_sock {
+	struct sock sk;
+	struct hpio_dev *hpdev;
+};
 
 
 static unsigned int hpio_net_id;
@@ -114,6 +126,21 @@ static inline struct hpio_dev *hpio_find_dev(struct net *net,
 
 	list_for_each_entry(hpdev, &hpnet->dev_list, list) {
 		if (hpdev->dev == dev)
+			return hpdev;
+	}
+	return NULL;
+}
+
+static inline struct hpio_dev *hpio_find_dev_by_index(struct net *net,
+						      int ifindex)
+{
+	struct hpio_dev *hpdev;
+	struct hpio_net *hpnet;
+
+	hpnet = (struct hpio_net *) net_generic(net, hpio_net_id);
+
+	list_for_each_entry(hpdev, &hpnet->dev_list, list) {
+		if (hpdev->dev->ifindex == ifindex)
 			return hpdev;
 	}
 	return NULL;
@@ -289,8 +316,26 @@ done:
 /* character device operations */
 
 static int
+hpio_start_dev(struct hpio_dev *hpdev)
+{
+	int ret = 0;
+
+	rtnl_lock();
+	if (netdev_is_rx_handler_busy(hpdev->dev)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	netdev_rx_handler_register(hpdev->dev, hpio_handle_frame, hpdev);
+
+out:
+	rtnl_unlock();
+	return 0;
+}
+
+static int
 hpio_open(struct inode *inode, struct file *filp)
 {
+	int ret = 0;
 	struct hpio_dev *hpdev;
 	struct net_device *dev;
 	char devname[IFNAMSIZ];
@@ -320,15 +365,10 @@ hpio_open(struct inode *inode, struct file *filp)
 	/* start to hook rx packets */
 	if ((filp->f_flags & O_ACCMODE) != O_WRONLY) {
 		/* rx_handler is registered when mode is not WRONLY (read). */
-		rtnl_lock();
-		if (!netdev_is_rx_handler_busy(dev)) {
-			netdev_rx_handler_register(dev, hpio_handle_frame,
-						   hpdev);
-		}
-		rtnl_unlock();
+		ret = hpio_start_dev(hpdev);
 	}
 
-	return 0;
+	return ret;
 }
 
 static ssize_t
@@ -366,14 +406,11 @@ hpio_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 }
 
 static ssize_t
-hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+hpio_read_iov(struct hpio_dev *hpdev, struct iov_iter *iter)
 {
 	ssize_t retval = 0;
 	size_t count = iter->nr_segs;
 	u32 copylen, pktlen, copynum, avail, i;
-
-	struct file *filp = iocb->ki_filp;
-	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), rx);
 	struct hpio_hdr hdr;
 	struct sk_buff *skb;
@@ -425,6 +462,16 @@ out:
 	return retval;
 }
 
+static ssize_t
+hpio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct file *filp = iocb->ki_filp;
+	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
+
+	return hpio_read_iov(hpdev, iter);
+}
+
+
 static ssize_t hpio_write(struct file *filp, const char __user *buf,
 			  size_t count, loff_t *ppos)
 {
@@ -469,18 +516,16 @@ static ssize_t hpio_write(struct file *filp, const char __user *buf,
 	return count;
 }
 
-static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
+static ssize_t hpio_write_iov(struct hpio_dev *hpdev, struct iov_iter *iter)
 {
 	int ret;
 	ssize_t retval = 0;
 	size_t count = iter->nr_segs;
 	u32 copylen, avail, i, copynum;
-	struct file *filp = iocb->ki_filp;
 	struct sk_buff *skb, **pskb;
 	struct net_device *dev;
 	struct netdev_queue *txq;
 	struct hpio_hdr *hdr;
-	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 	struct hpio_ring *ring = hpio_get_ring(hpdev, smp_processor_id(), tx);
 
 	/* send bulked packets */
@@ -580,6 +625,14 @@ static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	return retval;	/* retrun num of xmitted packets */
 }
 
+static ssize_t hpio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct file *filp = iocb->ki_filp;
+	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
+
+	return hpio_write_iov(hpdev, iter);
+}
+
 static unsigned int hpio_poll(struct file *file, poll_table *wait)
 {
 	struct hpio_dev *hpdev = (struct hpio_dev *)file->private_data;
@@ -592,15 +645,19 @@ static unsigned int hpio_poll(struct file *file, poll_table *wait)
 	return 0;
 }
 
+static void hpio_stop_dev(struct hpio_dev *hpdev)
+{
+	rtnl_lock();
+	netdev_rx_handler_unregister(hpdev->dev);
+	rtnl_unlock();
+}
+
 static int
 hpio_release(struct inode *inode, struct file *filp)
 {
 	struct hpio_dev *hpdev = (struct hpio_dev *)filp->private_data;
 
-	rtnl_lock();
-	netdev_rx_handler_unregister(hpdev->dev);
-	rtnl_unlock();
-
+	hpio_stop_dev(hpdev);
 	filp->private_data = NULL;
 
 	return 0;
@@ -615,6 +672,154 @@ static struct file_operations hpio_fops = {
 	.write_iter	= hpio_write_iter,
 	.poll		= hpio_poll,
 	.release	= hpio_release,
+};
+
+
+/* hpio socket operations */
+
+static inline struct hpio_sock *hpio_sk(const struct sock *sk)
+{
+	return (struct hpio_sock *)sk;
+}
+
+static int hpio_sock_release(struct socket *sock)
+{
+	struct sock *sk = sock->sk;
+	struct hpio_sock *hpsk;
+
+	if (!sk) {
+		pr_debug("NULL sk\n");
+		return 0;
+	}
+
+	hpsk = hpio_sk(sk);
+	if (hpsk->hpdev) {
+		atomic_dec(&hpsk->hpdev->refcnt);
+		hpio_stop_dev(hpsk->hpdev);
+		hpsk->hpdev = NULL;
+	}
+
+	sock_orphan(sk);
+	sk_refcnt_debug_release(sk);
+	sock_put(sk);
+	sock->sk = NULL;
+
+	return 0;
+}
+
+static int hpio_sock_bind(struct socket *sock, struct sockaddr *uaddr,
+			  int addrlen)
+{
+	int ret = 0;
+	struct net *net = sock_net(sock->sk);
+	struct hpio_sock *hpsk = hpio_sk(sock->sk);
+	struct hpio_dev *hpdev;
+	struct sockaddr_ll *sll = (struct sockaddr_ll *)uaddr;
+
+	if (addrlen < sizeof(struct sockaddr_ll))
+		return -EINVAL;
+
+	if (sll->sll_family != AF_HPIO)
+		return -EAFNOSUPPORT;
+
+	hpdev = hpio_find_dev_by_index(net, sll->sll_ifindex);
+	if (!hpdev)
+		return -ENODEV;
+
+	/* ok, start to use the device under hpio socket */
+	hpsk->hpdev = hpdev;
+	ret = hpio_start_dev(hpdev);
+	if (ret < 0)
+		goto err_out;
+
+	atomic_inc(&hpdev->refcnt);
+
+err_out:
+
+	return ret;
+}
+
+static unsigned int hpio_sock_poll(struct file *file, struct socket *sock,
+				   struct poll_table_struct *wait)
+{
+	struct hpio_sock *hpsk = hpio_sk(sock->sk);
+	struct hpio_ring *ring;
+
+	if (!hpsk->hpdev)
+		return -EINVAL;
+
+	ring = hpio_get_ring(hpsk->hpdev, smp_processor_id(), rx);
+
+	poll_wait(file, &hpio_wait, wait);
+	if (!ring_empty(ring))
+		return POLLIN | POLLRDNORM;
+
+	return 0;
+}
+
+static int hpio_sendmsg(struct socket *sock,
+			struct msghdr *m, size_t total_len)
+{
+	struct hpio_sock *hpsk = hpio_sk(sock->sk);
+
+	if (!hpsk->hpdev)
+		return -ENODEV;
+
+	return hpio_write_iov(hpsk->hpdev, &m->msg_iter);
+}
+
+static int hpio_recvmsg(struct socket *sock,
+			struct msghdr *m, size_t total_len, int flags)
+{
+	struct hpio_sock *hpsk = hpio_sk(sock->sk);
+
+	if (!hpsk->hpdev)
+		return -ENODEV;
+
+	return hpio_read_iov(hpsk->hpdev, &m->msg_iter);
+}
+
+static const struct proto_ops hpio_proto_ops = {
+	.family		= PF_HPIO,
+	.owner		= THIS_MODULE,
+	.release	= hpio_sock_release,
+	.bind		= hpio_sock_bind,
+	.poll		= hpio_sock_poll,
+	.sendmsg	= hpio_sendmsg,
+	.recvmsg	= hpio_recvmsg,
+	.mmap		= sock_no_mmap,
+};
+
+static struct proto hpio_proto = {
+	.name		= "HPIO",
+	.owner		= THIS_MODULE,
+	.obj_size	= sizeof(struct hpio_sock),
+};
+
+static int hpio_sock_create(struct net *net, struct socket *sock,
+			    int protocol, int kern)
+{
+	struct sock *sk;
+	struct hpio_sock *hpsk;
+
+	sock->ops = &hpio_proto_ops;
+
+	sk = sk_alloc(net, PF_HPIO, GFP_KERNEL, &hpio_proto, kern);
+	if (!sk)
+		return -ENOMEM;
+
+	sock_init_data(sock, sk);
+
+	hpsk = hpio_sk(sk);
+	hpsk->hpdev = NULL;	/* registered when bind() is called */
+
+	return 0;
+}
+
+static struct net_proto_family hpio_family_ops = {
+	.family	= PF_HPIO,
+	.create	= hpio_sock_create,
+	.owner 	= THIS_MODULE,
 };
 
 
@@ -673,6 +878,9 @@ int init_hpio_dev(struct hpio_dev *hpdev, struct net_device *dev)
 
 	pr_info("%s registered with %d TX/RX rings each\n",
 		hpdev->path, hpdev->num_rings);
+
+	/* init refcnt for hpio_sock */
+	atomic_set(&hpdev->refcnt, 0);
 
 	return 0;
 
@@ -799,8 +1007,25 @@ static int __init hpio_init_module(void)
 		goto failed;
 	}
 
+	rc = proto_register(&hpio_proto, 1);
+	if (rc) {
+		pr_err("proto_register failed %d\n", rc);
+		goto proto_register_failed;
+	}
+
+	rc = sock_register(&hpio_family_ops);
+	if (rc) {
+		pr_err("sock_register_failed %d\n", rc);
+		goto sock_register_failed;
+	}
+
 	return 0;
 
+
+sock_register_failed:
+	proto_unregister(&hpio_proto);
+proto_register_failed:
+	unregister_pernet_subsys(&hpio_net_ops);
 failed:
 	return rc;
 }
@@ -811,6 +1036,8 @@ static void __exit hpio_exit_module(void)
 
 	pr_info("unload hpio (v%s)\n", HPIO_VERSION);
 
+	sock_unregister(PF_HPIO);
+	proto_unregister(&hpio_proto);
 	unregister_pernet_subsys(&hpio_net_ops);
 
 	return;

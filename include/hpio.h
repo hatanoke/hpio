@@ -16,4 +16,9 @@ struct hpio_hdr {
 } __attribute__ ((__packed__));
 
 
+
+/* HPIO as socket address family */
+#define PF_HPIO		PF_IPX
+#define AF_HPIO		PF_HPIO
+
 #endif
