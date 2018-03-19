@@ -31,14 +31,15 @@ for(;;) {
 
 
 Existent high-speed packet I/O frameworks expose preallocated packet
-buffers in kernel space to user space by mmap(). This achieve
-zero-copy between kernel and user spaces, however, it require new APIs
-to manipulate packets on the buffers, instead of familiar APIs such as
-socket API. Additionally, special device drivers are required.
+buffers in kernel space to user space by mmap(). This achieves
+zero-copy between kernel and user spaces, however, it requires new
+APIs to manipulate packets on the buffers, instead of familiar APIs
+such as the socket API. Additionally, special device drivers are
+required.
 
 
 In contrast, hpio does not use preallocated packet buffers, therefore,
-it does not achieve zero-copy. However, hpio can adopt native system
+it cannot achieve zero-copy. However, hpio can adopt native system
 calls for its packet I/O API and work with native device drivers.
 
 
