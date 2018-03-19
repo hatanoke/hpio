@@ -2,8 +2,8 @@
 hpio
 ====
 
-The haeena (fast in Japanese) packet I/O, called hpio, is an
-alternative high-speed packet I/O framework.
+The haeena (this means *fast* in Japanese) packet I/O, called hpio, is
+an alternative high-speed packet I/O framework.
 
 **Advantage**
 - Very simple packet I/O API: read() and write() system call families.
