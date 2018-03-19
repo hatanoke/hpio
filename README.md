@@ -16,7 +16,7 @@ alternative high-speed packet I/O framework.
 
 
 
-How to transmit packets using hpio is described below.
+How to transmit packets using hpio is shown below.
 
 ```c
 int fd, ret;
