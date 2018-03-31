@@ -16,16 +16,27 @@ an alternative high-speed packet I/O framework.
 
 
 
-How to transmit packets using hpio is shown below.
-
+This examples shows how to transmit packets using hpio.
 ```c
-int fd, ret;
-struct iovec pkts[8];
+int fd, n;
+struct iovec iov[BURST];
+
+struct slot {
+        struct hpio_hdr hdr;
+        char pkt[PKTSIZE];
+} slot = { { HPIO_HDR_VERSION, sizeof(struct hpio_hdr), PKTSIZE } };
+
+build_packet(slot.pkt);
+
+for(n = 0; n < BURST; n++) {
+        iov[n].iov_base = &slot;
+        iov[n].iov_len = sizeof(slot);
+}
+
 fd = open("/dev/hpio/eth0", O_RDWR);
 
 for(;;) {
-        /* ... store hpio hdr and payload to pkts ... */
-        ret = writev(fd, pkts, 8);
+        writev(fd, iov, BURST);
 }
 ```
 
@@ -33,14 +44,15 @@ for(;;) {
 Existent high-speed packet I/O frameworks expose preallocated packet
 buffers in kernel space to user space by mmap(). This achieves
 zero-copy between kernel and user spaces, however, it requires new
-APIs to manipulate packets on the buffers, instead of familiar APIs
-such as the socket API. Additionally, special device drivers are
-required.
+APIs to manipulate packets on the framework-specific buffers, instead
+of familiar APIs such as the socket API. Additionally, special device
+drivers are required.
 
 
-In contrast, hpio does not use preallocated packet buffers, therefore,
-it cannot achieve zero-copy. However, hpio can adopt native system
-calls for its packet I/O API and work with native device drivers.
+In contrast, hpio does not use preallocated packet buffers and mmap(),
+therefore, it cannot achieve zero-copy. However, hpio can adapt native
+system calls for its packet I/O API and work with native device
+drivers.
 
 
 Although hpio involves memory copies on system calls and no
@@ -65,7 +77,6 @@ characeter devices are created.
 
 
 
-
 ## Contact
 
-upa at haeena.net, sora at haeena.net
+{upa|sora} at haeena.net
