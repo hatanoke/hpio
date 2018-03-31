@@ -9,7 +9,7 @@
 
 struct hpio_hdr {
 	uint8_t 	version;
-	uint8_t		hdrlen;		/* 4-byte word */
+	uint8_t		hdrlen;		/* hpio_hdr length */
 	uint16_t        pktlen;		/* byte length of pkt trailing hdr */
 
 	uint64_t        tstamp;		/* hw timestamp */
