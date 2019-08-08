@@ -16,7 +16,7 @@ an alternative fast packet I/O framework.
 
 
 
-This examples shows how to transmit packets using hpio.
+This example shows how to transmit packets using hpio.
 ```c
 int fd, n;
 struct iovec iov[BURST];
